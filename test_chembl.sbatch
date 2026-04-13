@@ -19,7 +19,7 @@ set -eo pipefail
 NNODES="${SLURM_JOB_NUM_NODES:-1}"
 GPUS_PER_NODE=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F',' '{print NF}')
 
-export MODEL_PATH=Qwen/Qwen2.5-Math-7B   # Qwen/Qwen2.5-Math-7B; Qwen/Qwen3-1.7B; RoadQAQ/Qwen2.5-Math-1.5B-16k-think; microsoft/Phi-4-mini-instruct; Qwen/Qwen3-4B-Instruct-2507
+export MODEL_PATH=Qwen/Qwen3-4B-Instruct-2507   # Qwen/Qwen2.5-Math-7B; Qwen/Qwen3-1.7B; RoadQAQ/Qwen2.5-Math-1.5B-16k-think; microsoft/Phi-4-mini-instruct; Qwen/Qwen3-4B-Instruct-2507
 MODEL_TAG="${MODEL_PATH##*/}"
 
 export CPATH="/usr/include:${CPATH:-}"
