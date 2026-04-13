@@ -87,8 +87,8 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.logger=['console','wandb'] \
     trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
     trainer.experiment_name=ppo_retro_test190_t0_chembl \
-    trainer.n_gpus_per_node=8 \
-    trainer.nnodes=1 \
+    trainer.n_gpus_per_node=$GPUS_PER_NODE \
+    trainer.nnodes=$NNODES \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.total_epochs=0 \
@@ -99,5 +99,5 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.maxstep=30 \
     tool.force_noloop=True \
     tool.use_batch_tool_calls=False \
-    tool.env='retro_noback_V4'" \
+    tool.env='retro_noback_V2'" \
     2>&1 | tee "logs/test_chembl_${SLURM_JOB_ID}.log"
