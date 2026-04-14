@@ -46,7 +46,9 @@ GPUS_PER_NODE=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F',' '{print NF}')
 export MODEL_PATH=Qwen/Qwen3-4B-Instruct-2507   # Qwen/Qwen2.5-Math-7B; Qwen/Qwen3-1.7B; RoadQAQ/Qwen2.5-Math-1.5B-16k-think; microsoft/Phi-4-mini-instruct; Qwen/Qwen3-4B-Instruct-2507
 MODEL_TAG="${MODEL_PATH##*/}"
 
-API_MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+# Qwen/Qwen3.5-35B-A3B
+# ...
+API_MODEL_NAME="Qwen/Qwen3.5-35B-A3B"
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 
 export CPATH="/usr/include:${CPATH:-}"
