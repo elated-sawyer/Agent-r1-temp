@@ -34,7 +34,10 @@ esac
 
 EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
 CHECKPOINT_DIR="./checkpoints/retro_qwen2.5-7b-instruct-1M_10_test/${EXPERIMENT_NAME}"
-API_MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+
+# Qwen/Qwen3.5-35B-A3B
+# ...
+API_MODEL_NAME="Qwen/Qwen3.5-35B-A3B"
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 VAL_TAG="$(basename "$VAL_FILES" .parquet)"
 LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_job-${SLURM_JOB_ID}.log"
