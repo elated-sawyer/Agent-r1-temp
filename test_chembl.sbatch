@@ -28,8 +28,8 @@ export RAY_TMPDIR="/tmp/$USER/ray/$SLURM_JOB_ID"
 mkdir -p "$RAY_TMPDIR"
 
 # # API model credentials (set these to use API-based evaluation)
-# export pjlab_APImodel_key="<placeholder>"
-# export pjlab_APImodel_url="<placeholder>"
+export pjlab_APImodel_key=$pjlab_APImodel_key
+export pjlab_APImodel_url=$pjlab_APImodel_url
 
 echo "=== Cluster Info ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"

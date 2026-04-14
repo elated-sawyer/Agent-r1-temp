@@ -124,7 +124,7 @@ memory_system/**/experiential_knowledge*.json
 # local logs and project outputs
 # Use logs/* not logs/ — Git cannot re-include a file under an ignored directory.
 logs/*
-!logs/mem2param_latest.log
+!logs/latest.log
 log
 outputs
 .history
