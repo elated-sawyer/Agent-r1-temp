@@ -58,6 +58,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.experiment_name=ppo_retro_test190_t0_chembl \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
+    tool.debug=True \
     tool.api_max_concurrency=2 \
     tool.max_turns=100 \
     tool.topk=10 \

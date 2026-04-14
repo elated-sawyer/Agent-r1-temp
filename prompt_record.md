@@ -197,3 +197,46 @@ The current pipeline launches via Ray (`ray.init` → `@ray.remote` → `RayAgen
 - **Do not change** the reward function interface or computation.
 - **Do not change** `ToolRLDataset` or `RewardManager` — they are already Ray-independent.
 - The pipeline must still produce the same `metric_dict` and `envs_var` output from validation.
+
+
+
+
+
+
+2026-04-14
+
+Add a **debug mode** to the API generation path so that every request/response is printed to stdout for inspection.
+
+### What to change
+
+**1. Config — `@agent_r1/src/config/agent_trainer.yaml`**
+
+Add a `debug` flag under the `tool:` section (default `False`).
+
+**2. Generation config dataclass — `@agent_r1/llm_agent/generation_retro_noback.py:29-46`**
+
+Add a `debug: bool = False` field to `ToolGenerationConfig`.
+
+**3. Where the config is constructed — `@agent_r1/src/agent_ray_trainer_retro_noback.py`**
+
+Pass `debug=self.config.tool.get('debug', False)` when building `ToolGenerationConfig` inside `validate()`.
+
+**4. API call method — `@agent_r1/llm_agent/generation_retro_noback.py:327-401`**
+
+Inside `_generate_with_api()`, when `self.config.debug` is `True`:
+
+- **Before the API calls** (after line 333 where `prompts` is decoded): print every prompt being sent. Print the sample index and a truncated preview (first 200 chars) for each prompt, e.g.:
+  ```
+  [DEBUG API] Sending 16 prompts to deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+  [DEBUG API] Prompt[0] (len=1234): <first 200 chars>...
+  ```
+- **After collecting results** (after the `response_texts` list is built, ~line 377): print every response. Same format — index, length, truncated preview:
+  ```
+  [DEBUG API] Response[0] (len=567): <first 200 chars>...
+  ```
+
+### Constraints
+
+- Guard all debug prints behind `if self.config.debug` so there is zero overhead when disabled.
+- Do not change the control flow, return values, or tokenization logic — only add print statements.
+- Keep the truncation preview short (200 chars) to avoid flooding the log on long sequences.

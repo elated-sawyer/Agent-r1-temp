@@ -45,7 +45,8 @@ class ToolGenerationConfig:
     use_api_model: bool = False
     api_model_name: str = ""
     api_max_concurrency: int = 32
-    
+    debug: bool = False
+
 class ToolGenerationManager:
     """Manager for handling LLM tool-based generation and interaction"""
     
@@ -332,6 +333,11 @@ class ToolGenerationManager:
         # Decode input_ids back to text prompts
         prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
 
+        if self.config.debug:
+            print(f"[DEBUG API] Sending {batch_size} prompts to {self.config.api_model_name}")
+            for i, p in enumerate(prompts):
+                print(f"[DEBUG API] Prompt[{i}] (len={len(p)}): {p[:200]}...")
+
         sem = asyncio.Semaphore(self.config.api_max_concurrency)
 
         async def _call_api(prompt: str) -> str:
@@ -375,6 +381,10 @@ class ToolGenerationManager:
                 response_texts.append("")
             else:
                 response_texts.append(result)
+
+        if self.config.debug:
+            for i, r in enumerate(response_texts):
+                print(f"[DEBUG API] Response[{i}] (len={len(r)}): {r[:200]}...")
 
         # Tokenize responses to match the tensor format from _generate_with_gpu_padding
         response_ids = self.tokenizer(

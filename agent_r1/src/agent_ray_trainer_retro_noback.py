@@ -152,6 +152,7 @@ class ValidationPipeline(object):
             use_api_model=self.config.tool.get('use_api_model', False),
             api_model_name=self.config.tool.get('api_model_name', ''),
             api_max_concurrency=self.config.tool.get('api_max_concurrency', 32),
+            debug=self.config.tool.get('debug', False),
         )
 
         generation_manager = ToolGenerationManager(
