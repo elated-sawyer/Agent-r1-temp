@@ -330,13 +330,18 @@ class ToolGenerationManager:
         input_ids = active_batch.batch['input_ids']
         batch_size = input_ids.shape[0]
 
-        # Decode input_ids back to text prompts
-        prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+        # Decode input_ids back to text prompts, stripping left-padding first
+        prompts = []
+        for ids in input_ids:
+            non_pad_ids = ids[ids != self.tokenizer.pad_token_id]
+            prompts.append(self.tokenizer.decode(non_pad_ids, skip_special_tokens=False))
 
         if self.config.debug:
-            print(f"[DEBUG API] Sending {batch_size} prompts to {self.config.api_model_name}")
-            for i, p in enumerate(prompts):
-                print(f"[DEBUG API] Prompt[{i}] (len={len(p)}): {p[:200]}...")
+            prompt_lens = [len(p) for p in prompts]
+            print(f"[DEBUG API] Sending {batch_size} prompts to {self.config.api_model_name} | "
+                  f"len min={min(prompt_lens)} max={max(prompt_lens)} avg={sum(prompt_lens)/len(prompt_lens):.0f}")
+            for i, p in enumerate(prompts[:2]):
+                print(f"[DEBUG API] Prompt[{i}] (len={len(p)}): {p[:]}...") # 500
 
         sem = asyncio.Semaphore(self.config.api_max_concurrency)
 
@@ -383,8 +388,11 @@ class ToolGenerationManager:
                 response_texts.append(result)
 
         if self.config.debug:
-            for i, r in enumerate(response_texts):
-                print(f"[DEBUG API] Response[{i}] (len={len(r)}): {r[:200]}...")
+            resp_lens = [len(r) for r in response_texts]
+            print(f"[DEBUG API] Received {len(response_texts)} responses | "
+                  f"len min={min(resp_lens)} max={max(resp_lens)} avg={sum(resp_lens)/len(resp_lens):.0f}")
+            for i, r in enumerate(response_texts[:2]):
+                print(f"[DEBUG API] Response[{i}] (len={len(r)}): {r[:]}...") # 500
 
         # Tokenize responses to match the tensor format from _generate_with_gpu_padding
         response_ids = self.tokenizer(
