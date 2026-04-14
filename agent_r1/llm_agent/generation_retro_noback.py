@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 
 import random
+from tqdm.auto import tqdm
 
 from .tensor_helper import TensorHelper, TensorConfig
 # from agent_r1.tool.tool_env import ToolEnv, step, step_batch
@@ -367,7 +368,10 @@ class ToolGenerationManager:
         rollings = gen_batch
 
         # Main generation loop
-        for step in range(self.config.max_turns):
+        desc = "Validation LLM turns" if self.is_validation else "Train LLM turns"
+        pbar = tqdm(range(self.config.max_turns), desc=desc, leave=True)
+        for step in pbar:
+            pbar.set_postfix(active=f"{active_mask.sum().item()}/{batch_size}")
             if not active_mask.sum():
                 break
             rollings.batch = self.tensor_fn.cut_to_effective_len(
@@ -439,6 +443,9 @@ class ToolGenerationManager:
 
 
         
+        pbar.set_postfix(active=f"{active_mask.sum().item()}/{batch_size}")
+        pbar.close()
+
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
         original_right_side['turns'] = turns

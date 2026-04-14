@@ -17,6 +17,44 @@ Generate a Slurm batch script `test_chembl.sbatch` that wraps the command in @te
 
 
 
+
+
+
+2026-04-14
+
+Add **progress monitoring and timing logs** to the `_validate` method in @agent_r1/src/agent_ray_trainer_retro_noback.py:521-685 so I can track where time is spent during validation runs.
+
+## What to add
+
+### 1. Overall validation timer
+- Record `time.time()` at the start of `_validate` (line ~523) and log the total elapsed time right before the `return` (line ~684).
+- Format: `[Validation] Completed in {elapsed:.1f}s — {total_samples} samples, {num_batches} batches`
+
+### 2. Progress bar for the multi-turn generation loop in `run_llm_loop` (@agent_r1/llm_agent/generation_retro_noback.py:370-441)
+The main loop runs up to `max_turns` iterations (LLM generate → tool execute per turn). Wrap the `for step in range(self.config.max_turns)` loop with a `tqdm` progress bar:
+- Total = `self.config.max_turns`, updated each iteration.
+- Show the number of still-active trajectories in the bar's postfix: `active={active_mask.sum().item()}/{batch_size}`.
+- Break out early (as the existing code does) when `active_mask.sum() == 0`; tqdm should still close cleanly.
+- Use `tqdm.auto` so it works in both terminal and notebook contexts.
+- The bar description should be `"Validation LLM turns"` (or `"Train LLM turns"` depending on `self.is_validation`).
+
+### 3. Progress bar for the validation reward computation phase
+- In `_validate` (@agent_r1/src/agent_ray_trainer_retro_noback.py), the `for test_data in self.val_dataloader` loop (line ~557) currently has exactly 1 batch, but still wrap the key phases with a simple `tqdm` or log so the user can see the pipeline moving:
+  - Before `run_llm_loop` starts: print `[Validation] Starting generation for {len(test_batch)} samples...`
+  - After `run_llm_loop` finishes: print `[Validation] Generation complete. Computing rewards...`
+  - After `val_reward_fn` finishes: print `[Validation] Rewards computed. mean_answer_acc={mean_answer:.4f}`
+
+## Constraints
+- Use Python `logging.getLogger(__name__)` with `logger.info(...)` instead of bare `print()`. If a logger is already available on `self`, use that.
+- **Do not modify** any computation logic, tensor shapes, return values, or the reward function interface.
+- Keep the existing `print(...)` statements at lines 595 and 609 as-is (or convert them to logger calls too, your choice).
+
+
+
+
+
+
+
 2026-04-14
 
 Add an **API-model generation path** to the retro_noback pipeline so I can evaluate an external LLM (via OpenAI-compatible API) on the same chembl benchmark, instead of the local vLLM model.

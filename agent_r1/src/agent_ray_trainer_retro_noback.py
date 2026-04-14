@@ -521,6 +521,8 @@ class RayAgentTrainer(object):
 
     def _validate(self):
         import torch
+        import time
+        val_start_time = time.time()
         reward_tensor_lst = []
         turns_lst = []
         data_source_lst = []
@@ -598,6 +600,8 @@ class RayAgentTrainer(object):
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
 
             first_input_ids = test_gen_batch_padded.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+            print(f'[Validation] Starting generation for {len(test_batch)} samples...')
+            gen_start_time = time.time()
             test_output_gen_batch_padded = generation_manager.run_llm_loop(
                 test_gen_batch_padded,
                 envs=envs,
@@ -606,7 +610,7 @@ class RayAgentTrainer(object):
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            print('validation generation end')
+            print(f'[Validation] Generation complete in {time.time() - gen_start_time:.1f}s. Computing rewards...')
 
             for key in test_output_gen_batch.batch.keys():
                 test_output_gen_batch.batch[key] = test_output_gen_batch.batch[key].long()
@@ -632,6 +636,7 @@ class RayAgentTrainer(object):
             # Store scores
             # scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(answer_lst)
+            print(f'[Validation] Rewards computed. mean_answer_acc={np.mean(answer_lst):.4f}')
 
             reward_tensor_lst.append(reward_tensor)
             turns_lst.append(test_batch.batch['turns'])
@@ -681,6 +686,8 @@ class RayAgentTrainer(object):
             metric_dict[f'val/format_score/{data_source}'] = np.mean(formats)
         for data_source, turns in data_source_turns.items():
             metric_dict[f'val/turns/{data_source}'] = np.mean(turns)
+        total_samples = reward_tensor.shape[0]
+        print(f'[Validation] Completed in {time.time() - val_start_time:.1f}s — {total_samples} samples')
         return metric_dict, envs_var
 
     def init_workers(self):
