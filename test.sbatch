@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=test_chembl_ppo
+#SBATCH --job-name=test_eval_ppo
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=128
@@ -13,6 +13,29 @@
 set -eo pipefail
 
 #======================================
+# Dataset selection: "chembl" (default) or "retro"
+# Override via:  sbatch --export=DATASET=retro test_chembl.sbatch
+#======================================
+DATASET="${DATASET:-chembl}"
+
+case "$DATASET" in
+    chembl)
+        VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet"
+        ;;
+    retro)
+        VAL_FILES="./data/reaction_pathway_search/validation_retro_190.parquet"
+        ;;
+    *)
+        echo "ERROR: unknown DATASET='$DATASET' (expected 'chembl' or 'retro')" >&2
+        exit 1
+        ;;
+esac
+
+VAL_TAG="$(basename "$VAL_FILES" .parquet)"
+EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
+CHECKPOINT_DIR="./checkpoints/retro_qwen2.5-7b-instruct-1M_10_test/${EXPERIMENT_NAME}"
+
+#======================================
 # Environment Variables
 #======================================
 
@@ -22,15 +45,28 @@ GPUS_PER_NODE=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | awk -F',' '{print NF}')
 export MODEL_PATH=Qwen/Qwen3-4B-Instruct-2507   # Qwen/Qwen2.5-Math-7B; Qwen/Qwen3-1.7B; RoadQAQ/Qwen2.5-Math-1.5B-16k-think; microsoft/Phi-4-mini-instruct; Qwen/Qwen3-4B-Instruct-2507
 MODEL_TAG="${MODEL_PATH##*/}"
 
+API_MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+API_LOG_TAG="${API_MODEL_NAME//\//_}"
+
 export CPATH="/usr/include:${CPATH:-}"
 export HF_HUB_OFFLINE=1
 export RAY_TMPDIR="/tmp/$USER/ray/$SLURM_JOB_ID"
 mkdir -p "$RAY_TMPDIR"
 
-# # API model credentials (set these to use API-based evaluation)
+# API model credentials (set these to use API-based evaluation)
 export pjlab_APImodel_key=$pjlab_APImodel_key
 export pjlab_APImodel_url=$pjlab_APImodel_url
 
+mkdir -p logs
+LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_job-${SLURM_JOB_ID}.log"
+
+echo "=== Run Config ==="
+echo "DATASET=$DATASET"
+echo "VAL_FILES=$VAL_FILES"
+echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
+echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
+echo "API_MODEL_NAME=$API_MODEL_NAME"
+echo "LOG_FILE=$LOG_FILE"
 echo "=== Cluster Info ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
 echo "NNODES=$NNODES"
@@ -39,16 +75,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
 nvidia-smi || true
 
 #======================================
-# Run test_chembl evaluation
+# Run evaluation
 #======================================
 export_pth=./export_model/retro_qwen2.5-7b-instruct-1M/ppo_retro/global_step_190/actor
-
-VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet"
-API_MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-VAL_LOG_TAG="$(basename "$VAL_FILES" .parquet)"
-API_LOG_TAG="${API_MODEL_NAME//\//_}"
-TEST_CHEMBL_LOG="logs/test_chembl_api-${API_LOG_TAG}_val-${VAL_LOG_TAG}_job-${SLURM_JOB_ID}.log"
-mkdir -p logs
 
 srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     bash -c "source ~/miniforge3/etc/profile.d/conda.sh && conda activate retro_r1 && \
@@ -93,11 +122,11 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     algorithm.use_process_rewards=False \
     algorithm.adv_estimator=gae \
     algorithm.kl_ctrl.kl_coef=0.001 \
-    trainer.default_local_dir=./checkpoints/retro_qwen2.5-7b-instruct-1M_10_test/ppo_retro_test190_t0_chembl \
+    trainer.default_local_dir=$CHECKPOINT_DIR \
     trainer.critic_warmup=3 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
-    trainer.experiment_name=ppo_retro_test190_t0_chembl \
+    trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
     trainer.save_freq=10 \
@@ -115,4 +144,4 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.env='retro_noback_V2' \
     tool.use_api_model=True \
     tool.api_model_name='$API_MODEL_NAME'" \
-    2>&1 | tee "$TEST_CHEMBL_LOG"
+    2>&1 | tee "$LOG_FILE"
