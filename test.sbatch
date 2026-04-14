@@ -2,9 +2,9 @@
 #SBATCH --job-name=test_eval_ppo
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
-#SBATCH --gres=gpu:8
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:2
+#SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
