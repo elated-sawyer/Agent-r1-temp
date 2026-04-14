@@ -379,15 +379,21 @@ class ToolGenerationManager:
         prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
 
         async def _call_api(prompt: str) -> str:
-            response = await self._api_client.chat.completions.create(
-                model=self.config.api_model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=self.config.max_response_length,
-            )
-            return response.choices[0].message.content or ""
+            """Call external API and always surface plain RuntimeError on failure."""
+            try:
+                response = await self._api_client.chat.completions.create(
+                    model=self.config.api_model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=self.config.max_response_length,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as exc:
+                # Some API client exceptions are not picklable across Ray workers.
+                raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
 
         async def _call_all():
-            return await asyncio.gather(*[_call_api(p) for p in prompts])
+            # Collect all results to avoid one transient API error crashing the whole batch.
+            return await asyncio.gather(*[_call_api(p) for p in prompts], return_exceptions=True)
 
         # Run async calls
         try:
@@ -395,12 +401,25 @@ class ToolGenerationManager:
         except RuntimeError:
             loop = None
 
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                response_texts = pool.submit(asyncio.run, _call_all()).result()
-        else:
-            response_texts = asyncio.run(_call_all())
+        try:
+            if loop and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    api_results = pool.submit(asyncio.run, _call_all()).result()
+            else:
+                api_results = asyncio.run(_call_all())
+        except Exception as exc:
+            raise RuntimeError(
+                f"API batch generation failed before decoding: {type(exc).__name__}: {exc}"
+            ) from None
+
+        response_texts = []
+        for result in api_results:
+            if isinstance(result, Exception):
+                print(f"[WARNING] {result}")
+                response_texts.append("")
+            else:
+                response_texts.append(result)
 
         # Tokenize responses to match the tensor format from _generate_with_gpu_padding
         response_ids = self.tokenizer(
