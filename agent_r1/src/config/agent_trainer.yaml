@@ -219,3 +219,5 @@ tool:
     <|im_start|>assistant
     <think>
   env: search
+  use_api_model: False
+  api_model_name: ""

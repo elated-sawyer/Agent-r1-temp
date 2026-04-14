@@ -6,12 +6,18 @@ import torch
 import re
 import json
 import os
+import asyncio
 from collections import defaultdict
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 
 import random
 from tqdm.auto import tqdm
+
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
 
 from .tensor_helper import TensorHelper, TensorConfig
 # from agent_r1.tool.tool_env import ToolEnv, step, step_batch
@@ -36,6 +42,8 @@ class ToolGenerationConfig:
     tool_response_start: str = "<tool_response>"
     tool_response_end: str = "</tool_response>"
     tool_custom_response_template: str = ""
+    use_api_model: bool = False
+    api_model_name: str = ""
     
 class ToolGenerationManager:
     """Manager for handling LLM tool-based generation and interaction"""
@@ -58,6 +66,18 @@ class ToolGenerationManager:
             max_tool_response_length=config.max_tool_response_length,  # Renamed
             max_start_length=config.max_start_length,
         ))
+        self._api_client = self._build_api_client() if config.use_api_model else None
+
+    def _build_api_client(self):
+        if AsyncOpenAI is None:
+            return None
+        api_key = os.environ.get("pjlab_APImodel_key")
+        if not api_key:
+            return None
+        base_url = os.environ.get("pjlab_APImodel_url")
+        if base_url:
+            return AsyncOpenAI(base_url=base_url, api_key=api_key)
+        return AsyncOpenAI(api_key=api_key)
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -349,7 +369,63 @@ class ToolGenerationManager:
             
         padded_output.batch = trimmed_batch
         return padded_output
-    
+
+    def _generate_with_api(self, active_batch: DataProto) -> DataProto:
+        """Generate responses using an external API model instead of local vLLM."""
+        input_ids = active_batch.batch['input_ids']
+        batch_size = input_ids.shape[0]
+
+        # Decode input_ids back to text prompts
+        prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+
+        async def _call_api(prompt: str) -> str:
+            response = await self._api_client.chat.completions.create(
+                model=self.config.api_model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=self.config.max_response_length,
+            )
+            return response.choices[0].message.content or ""
+
+        async def _call_all():
+            return await asyncio.gather(*[_call_api(p) for p in prompts])
+
+        # Run async calls
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                response_texts = pool.submit(asyncio.run, _call_all()).result()
+        else:
+            response_texts = asyncio.run(_call_all())
+
+        # Tokenize responses to match the tensor format from _generate_with_gpu_padding
+        response_ids = self.tokenizer(
+            response_texts,
+            add_special_tokens=False,
+            return_tensors='pt',
+            padding='longest',
+        )['input_ids']
+
+        # Pad/truncate to max_response_length to match expected shape
+        max_resp_len = self.config.max_response_length
+        if response_ids.shape[1] < max_resp_len:
+            pad = torch.full(
+                (batch_size, max_resp_len - response_ids.shape[1]),
+                self.tokenizer.pad_token_id,
+                dtype=response_ids.dtype,
+            )
+            response_ids = torch.cat([response_ids, pad], dim=1)
+        elif response_ids.shape[1] > max_resp_len:
+            response_ids = response_ids[:, :max_resp_len]
+
+        result = DataProto.from_dict({'responses': response_ids})
+        result.meta_info = active_batch.meta_info if hasattr(active_batch, 'meta_info') and active_batch.meta_info else {}
+        return result
+
     def run_llm_loop(self, gen_batch, envs: List[Any] = None,
                     initial_input_ids: torch.Tensor = None) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
@@ -383,7 +459,10 @@ class ToolGenerationManager:
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
             })
-            gen_output = self._generate_with_gpu_padding(rollings_active)
+            if self.config.use_api_model and self._api_client is not None:
+                gen_output = self._generate_with_api(rollings_active)
+            else:
+                gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
             responses_ids, responses_str, new_active_masks = self._postprocess_responses(gen_output.batch['responses'])

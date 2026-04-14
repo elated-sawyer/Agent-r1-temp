@@ -27,6 +27,10 @@ export HF_HUB_OFFLINE=1
 export RAY_TMPDIR="/tmp/$USER/ray/$SLURM_JOB_ID"
 mkdir -p "$RAY_TMPDIR"
 
+# # API model credentials (set these to use API-based evaluation)
+# export pjlab_APImodel_key="<placeholder>"
+# export pjlab_APImodel_url="<placeholder>"
+
 echo "=== Cluster Info ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
 echo "NNODES=$NNODES"
@@ -99,5 +103,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.maxstep=30 \
     tool.force_noloop=True \
     tool.use_batch_tool_calls=False \
-    tool.env='retro_noback_V2'" \
+    tool.env='retro_noback_V2' \
+    tool.use_api_model=True \
+    tool.api_model_name='deepseek-ai/DeepSeek-R1-Distill-Qwen-14B'" \
     2>&1 | tee "logs/test_chembl_${SLURM_JOB_ID}.log"

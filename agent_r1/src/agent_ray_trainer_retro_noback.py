@@ -546,6 +546,8 @@ class RayAgentTrainer(object):
             tool_response_start=self.config.tool.tool_response_start,
             tool_response_end=self.config.tool.tool_response_end,
             tool_custom_response_template=self.config.tool.tool_custom_response_template,
+            use_api_model=self.config.tool.get('use_api_model', False),
+            api_model_name=self.config.tool.get('api_model_name', ''),
         )
 
         generation_manager = ToolGenerationManager(
@@ -1068,6 +1070,8 @@ class RayAgentTrainer(object):
             tool_response_start=self.config.tool.tool_response_start,
             tool_response_end=self.config.tool.tool_response_end,
             tool_custom_response_template=self.config.tool.tool_custom_response_template,
+            use_api_model=self.config.tool.get('use_api_model', False),
+            api_model_name=self.config.tool.get('api_model_name', ''),
         )
 
         generation_manager = ToolGenerationManager(
