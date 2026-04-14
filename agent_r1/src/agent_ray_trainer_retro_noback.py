@@ -30,6 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from agent_r1.llm_agent.generation_retro_noback import ToolGenerationManager, ToolGenerationConfig
 from agent_r1.tool.tool_env import ToolEnv
 
+from tqdm.auto import tqdm
 from filelock import FileLock
 import tempfile
 import pickle
@@ -150,6 +151,7 @@ class ValidationPipeline(object):
             tool_custom_response_template=self.config.tool.tool_custom_response_template,
             use_api_model=self.config.tool.get('use_api_model', False),
             api_model_name=self.config.tool.get('api_model_name', ''),
+            api_max_concurrency=self.config.tool.get('api_max_concurrency', 32),
         )
 
         generation_manager = ToolGenerationManager(
@@ -159,7 +161,10 @@ class ValidationPipeline(object):
         )
 
         envs_var = []
-        for test_data in self.val_dataloader:
+        total_samples_done = 0
+        running_acc = []
+        val_pbar = tqdm(self.val_dataloader, desc="Validation batches", leave=True)
+        for batch_idx, test_data in enumerate(val_pbar):
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
@@ -190,11 +195,13 @@ class ValidationPipeline(object):
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
             }
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+            if batch_idx == 0:
+                print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
             # No padding needed for API-based generation (no GPU-divisible size requirement)
             first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-            print(f'[Validation] Starting generation for {len(test_batch)} samples...')
+            batch_size = len(test_batch)
+            val_pbar.set_postfix(batch_samples=batch_size, total_done=total_samples_done)
             gen_start_time = time.time()
             test_output_gen_batch = generation_manager.run_llm_loop(
                 test_gen_batch,
@@ -202,7 +209,8 @@ class ValidationPipeline(object):
                 initial_input_ids=first_input_ids,
             )
 
-            print(f'[Validation] Generation complete in {time.time() - gen_start_time:.1f}s. Computing rewards...')
+            gen_elapsed = time.time() - gen_start_time
+            print(f'[Validation batch {batch_idx}] Generation complete in {gen_elapsed:.1f}s. Computing rewards...')
 
             for key in test_output_gen_batch.batch.keys():
                 test_output_gen_batch.batch[key] = test_output_gen_batch.batch[key].long()
@@ -224,13 +232,21 @@ class ValidationPipeline(object):
 
             # Store scores
             sample_scores.extend(answer_lst)
-            print(f'[Validation] Rewards computed. mean_answer_acc={np.mean(answer_lst):.4f}')
+            total_samples_done += batch_size
+            running_acc.extend(answer_lst)
+            val_pbar.set_postfix(
+                total_done=total_samples_done,
+                acc=f"{np.mean(running_acc):.4f}",
+                last_gen=f"{gen_elapsed:.1f}s",
+            )
 
             reward_tensor_lst.append(reward_tensor)
             turns_lst.append(test_batch.batch['turns'])
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
             envs_var += [env.get_tracking_variables() for env in envs]
+
+        val_pbar.close()
 
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)

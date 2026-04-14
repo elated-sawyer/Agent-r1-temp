@@ -44,6 +44,7 @@ class ToolGenerationConfig:
     tool_custom_response_template: str = ""
     use_api_model: bool = False
     api_model_name: str = ""
+    api_max_concurrency: int = 32
     
 class ToolGenerationManager:
     """Manager for handling LLM tool-based generation and interaction"""
@@ -331,21 +332,22 @@ class ToolGenerationManager:
         # Decode input_ids back to text prompts
         prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
 
+        sem = asyncio.Semaphore(self.config.api_max_concurrency)
+
         async def _call_api(prompt: str) -> str:
-            """Call external API and always surface plain RuntimeError on failure."""
-            try:
-                response = await self._api_client.chat.completions.create(
-                    model=self.config.api_model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=self.config.max_response_length,
-                )
-                return response.choices[0].message.content or ""
-            except Exception as exc:
-                # Some API client exceptions are not picklable across Ray workers.
-                raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
+            """Call external API with concurrency limit."""
+            async with sem:
+                try:
+                    response = await self._api_client.chat.completions.create(
+                        model=self.config.api_model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=self.config.max_response_length,
+                    )
+                    return response.choices[0].message.content or ""
+                except Exception as exc:
+                    raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
 
         async def _call_all():
-            # Collect all results to avoid one transient API error crashing the whole batch.
             return await asyncio.gather(*[_call_api(p) for p in prompts], return_exceptions=True)
 
         # Run async calls
