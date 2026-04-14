@@ -123,3 +123,20 @@ Currently, `run_llm_loop` (in @agent_r1/llm_agent/generation_retro_noback.py:352
 - **Keep the local vLLM path as the default** (`use_api_model=False`). The API path is only used when explicitly enabled.
 - **Token format**: The API responses must be tokenized and padded to match the same tensor format that `_generate_with_gpu_padding` returns, so downstream code (`_postprocess_responses`, `_update_rolling_state`, etc.) works without changes.
 
+
+
+
+
+
+
+2026-04-14
+
+
+Now I have developed the validation with calling API model @prompt_record.md:57-126 , So that, I think ray cluster use is not need anymore, 
+And also I want to delete all the training process, only making it for validation
+I want to clean the whole validation pipeline, 
+
+This would be a huge update on the project, don't worry I have made a new branch
+
+
+
