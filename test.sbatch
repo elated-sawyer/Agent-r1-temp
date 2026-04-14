@@ -16,7 +16,8 @@ set -eo pipefail
 # Dataset selection: "chembl" (default) or "retro"
 # Override via:  sbatch --export=ALL,DATASET=retro test_chembl.sbatch
 #======================================
-DATASET="${DATASET:-chembl}"
+# DATASET="${DATASET:-chembl}"
+DATASET="retro"
 
 case "$DATASET" in
     chembl)
