@@ -43,11 +43,18 @@ nvidia-smi || true
 #======================================
 export_pth=./export_model/retro_qwen2.5-7b-instruct-1M/ppo_retro/global_step_190/actor
 
+VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet"
+API_MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+VAL_LOG_TAG="$(basename "$VAL_FILES" .parquet)"
+API_LOG_TAG="${API_MODEL_NAME//\//_}"
+TEST_CHEMBL_LOG="logs/test_chembl_api-${API_LOG_TAG}_val-${VAL_LOG_TAG}_job-${SLURM_JOB_ID}.log"
+mkdir -p logs
+
 srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     bash -c "source ~/miniforge3/etc/profile.d/conda.sh && conda activate retro_r1 && \
     PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
     data.train_files=\"./data/reaction_pathway_search/train_h4_10.parquet\" \
-    data.val_files=\"./data/reaction_pathway_search/validation_chembl_1000.parquet\" \
+    data.val_files=\"$VAL_FILES\" \
     data.train_batch_size=128 \
     data.max_prompt_length=32768 \
     data.max_response_length=32768 \
@@ -97,6 +104,8 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.test_freq=10 \
     trainer.total_epochs=0 \
     trainer.val_before_train=True \
+    tool.api_max_concurrency=16 \
+    tool.debug=True \
     tool.max_turns=100 \
     tool.topk=10 \
     tool.shuffle=False \
@@ -105,5 +114,5 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.use_batch_tool_calls=False \
     tool.env='retro_noback_V2' \
     tool.use_api_model=True \
-    tool.api_model_name='deepseek-ai/DeepSeek-R1-Distill-Qwen-14B'" \
-    2>&1 | tee "logs/test_chembl_${SLURM_JOB_ID}.log"
+    tool.api_model_name='$API_MODEL_NAME'" \
+    2>&1 | tee "$TEST_CHEMBL_LOG"

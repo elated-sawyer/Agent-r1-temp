@@ -221,3 +221,5 @@ tool:
   env: search
   use_api_model: False
   api_model_name: ""
+  api_max_concurrency: 8
+  debug: False

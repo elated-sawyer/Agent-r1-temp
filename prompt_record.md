@@ -123,3 +123,116 @@ Currently, `run_llm_loop` (in @agent_r1/llm_agent/generation_retro_noback.py:352
 - **Keep the local vLLM path as the default** (`use_api_model=False`). The API path is only used when explicitly enabled.
 - **Token format**: The API responses must be tokenized and padded to match the same tensor format that `_generate_with_gpu_padding` returns, so downstream code (`_postprocess_responses`, `_update_rolling_state`, etc.) works without changes.
 
+
+
+
+
+
+2026-04-14
+
+Make `api_max_concurrency` and `debug` configurable end-to-end: YAML config → trainer wiring → dataclass → runtime usage in `_generate_with_api`.
+
+## Files to change (3 files)
+
+### 1. YAML config — `agent_r1/src/config/agent_trainer.yaml` (line ~223)
+
+Add two new keys under the `tool:` section, right after `api_model_name`:
+
+```yaml
+  api_max_concurrency: 8
+  debug: False
+```
+
+### 2. Trainer wiring — `agent_r1/src/agent_ray_trainer_retro_noback.py`
+
+There are **two** `ToolGenerationConfig(...)` construction sites (lines ~536 and ~1060). In **both**, add these two lines after the `api_model_name=...` line, following the same `.get()` pattern:
+
+```python
+            api_max_concurrency=self.config.tool.get('api_max_concurrency', 8),
+            debug=self.config.tool.get('debug', False),
+```
+
+### 3. Dataclass + method — `agent_r1/llm_agent/generation_retro_noback.py`
+
+#### 3a. `ToolGenerationConfig` dataclass (line ~30)
+
+Add two new fields with defaults after `api_model_name`:
+
+```python
+api_max_concurrency: int = 8      # max concurrent async API requests
+debug: bool = False                # when True, print verbose debug info
+```
+
+#### 3b. `_generate_with_api` method (lines 373-446)
+
+Apply these changes **in order**:
+
+a) **Strip pad tokens before decoding** — replace the current one-liner `batch_decode` with a loop that filters out `pad_token_id` per row before decoding:
+```python
+prompts = []
+for ids in input_ids:
+    non_pad_ids = ids[ids != self.tokenizer.pad_token_id]
+    prompts.append(self.tokenizer.decode(non_pad_ids, skip_special_tokens=False))
+```
+
+b) **Add debug logging after building prompts** — if `self.config.debug`, print batch size, model name, and prompt length stats (min/max/avg), plus the first 2 full prompts.
+
+c) **Throttle concurrency** — create `sem = asyncio.Semaphore(self.config.api_max_concurrency)` and wrap the body of `_call_api` with `async with sem:`.
+
+d) **Add debug logging after collecting responses** — if `self.config.debug`, print response count and length stats (min/max/avg), plus the first 2 full responses.
+
+### Reference implementation
+
+The full target state for `_generate_with_api` is shown below. Use this as a guide — the key additions vs. the current code are the pad-stripping, the semaphore, and the two `if self.config.debug:` blocks:
+
+```python
+def _generate_with_api(self, active_batch: DataProto) -> DataProto:
+    """Generate responses using an external API model instead of local vLLM."""
+    input_ids = active_batch.batch['input_ids']
+    batch_size = input_ids.shape[0]
+
+    # Decode input_ids back to text prompts, stripping left-padding first
+    prompts = []
+    for ids in input_ids:
+        non_pad_ids = ids[ids != self.tokenizer.pad_token_id]
+        prompts.append(self.tokenizer.decode(non_pad_ids, skip_special_tokens=False))
+
+    if self.config.debug:
+        prompt_lens = [len(p) for p in prompts]
+        print(f"[DEBUG API] Sending {batch_size} prompts to {self.config.api_model_name} | "
+              f"len min={min(prompt_lens)} max={max(prompt_lens)} avg={sum(prompt_lens)/len(prompt_lens):.0f}")
+        for i, p in enumerate(prompts[:2]):
+            print(f"[DEBUG API] Prompt[{i}] (len={len(p)}): {p[:]}")
+
+    sem = asyncio.Semaphore(self.config.api_max_concurrency)
+
+    async def _call_api(prompt: str) -> str:
+        """Call external API with concurrency limit."""
+        async with sem:
+            try:
+                response = await self._api_client.chat.completions.create(
+                    model=self.config.api_model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=self.config.max_response_length,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as exc:
+                raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
+
+    # ... (async runner logic stays the same) ...
+
+    if self.config.debug:
+        resp_lens = [len(r) for r in response_texts]
+        print(f"[DEBUG API] Received {len(response_texts)} responses | "
+              f"len min={min(resp_lens)} max={max(resp_lens)} avg={sum(resp_lens)/len(resp_lens):.0f}")
+        for i, r in enumerate(response_texts[:2]):
+            print(f"[DEBUG API] Response[{i}] (len={len(r)}): {r[:]}")
+
+    # ... (tokenization + padding logic stays the same) ...
+```
+
+## Do NOT change
+
+- The async runner logic (`_call_all`, event-loop detection, `ThreadPoolExecutor` fallback)
+- The tokenization and padding logic after `response_texts`
+- Any other methods or classes in this file

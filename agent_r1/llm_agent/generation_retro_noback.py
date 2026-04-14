@@ -44,6 +44,8 @@ class ToolGenerationConfig:
     tool_custom_response_template: str = ""
     use_api_model: bool = False
     api_model_name: str = ""
+    api_max_concurrency: int = 8
+    debug: bool = False
     
 class ToolGenerationManager:
     """Manager for handling LLM tool-based generation and interaction"""
@@ -375,21 +377,34 @@ class ToolGenerationManager:
         input_ids = active_batch.batch['input_ids']
         batch_size = input_ids.shape[0]
 
-        # Decode input_ids back to text prompts
-        prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+        # Decode input_ids back to text prompts, stripping left-padding first
+        prompts = []
+        for ids in input_ids:
+            non_pad_ids = ids[ids != self.tokenizer.pad_token_id]
+            prompts.append(self.tokenizer.decode(non_pad_ids, skip_special_tokens=False))
+
+        if self.config.debug:
+            prompt_lens = [len(p) for p in prompts]
+            print(f"[DEBUG API] Sending {batch_size} prompts to {self.config.api_model_name} | "
+                  f"len min={min(prompt_lens)} max={max(prompt_lens)} avg={sum(prompt_lens)/len(prompt_lens):.0f}")
+            for i, p in enumerate(prompts[:2]):
+                print(f"[DEBUG API] Prompt[{i}] (len={len(p)}): {p[:]}")
+
+        sem = asyncio.Semaphore(self.config.api_max_concurrency)
 
         async def _call_api(prompt: str) -> str:
-            """Call external API and always surface plain RuntimeError on failure."""
-            try:
-                response = await self._api_client.chat.completions.create(
-                    model=self.config.api_model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=self.config.max_response_length,
-                )
-                return response.choices[0].message.content or ""
-            except Exception as exc:
-                # Some API client exceptions are not picklable across Ray workers.
-                raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
+            """Call external API with concurrency limit."""
+            async with sem:
+                try:
+                    response = await self._api_client.chat.completions.create(
+                        model=self.config.api_model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=self.config.max_response_length,
+                    )
+                    return response.choices[0].message.content or ""
+                except Exception as exc:
+                    # Some API client exceptions are not picklable across Ray workers.
+                    raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
 
         async def _call_all():
             # Collect all results to avoid one transient API error crashing the whole batch.
@@ -420,6 +435,13 @@ class ToolGenerationManager:
                 response_texts.append("")
             else:
                 response_texts.append(result)
+
+        if self.config.debug:
+            resp_lens = [len(r) for r in response_texts]
+            print(f"[DEBUG API] Received {len(response_texts)} responses | "
+                  f"len min={min(resp_lens)} max={max(resp_lens)} avg={sum(resp_lens)/len(resp_lens):.0f}")
+            for i, r in enumerate(response_texts[:2]):
+                print(f"[DEBUG API] Response[{i}] (len={len(r)}): {r[:]}")
 
         # Tokenize responses to match the tensor format from _generate_with_gpu_padding
         response_ids = self.tokenizer(

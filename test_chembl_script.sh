@@ -54,6 +54,8 @@ python3 -m agent_r1.src.main_agent_retro_noback     \
     trainer.test_freq=10     \
     trainer.total_epochs=0     \
     trainer.val_before_train=True     \
+    tool.api_max_concurrency=8 \
+    tool.debug=True \
     tool.max_turns=100     \
     tool.topk=10     \
     tool.shuffle=False     \
