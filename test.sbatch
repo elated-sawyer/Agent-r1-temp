@@ -16,7 +16,8 @@ set -eo pipefail
 # Dataset selection: "chembl" (default) or "retro"
 # Override via:  sbatch --export=DATASET=retro test_chembl.sbatch
 #======================================
-DATASET="${DATASET:-chembl}"
+# DATASET="${DATASET:-chembl}"
+DATASET=retro
 
 case "$DATASET" in
     chembl)
@@ -58,7 +59,7 @@ export pjlab_APImodel_key=$pjlab_APImodel_key
 export pjlab_APImodel_url=$pjlab_APImodel_url
 
 mkdir -p logs
-LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_job-${SLURM_JOB_ID}.log"
+LOG_FILE="logs/test_main_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_job-${SLURM_JOB_ID}.log"
 
 echo "=== Run Config ==="
 echo "DATASET=$DATASET"
@@ -141,7 +142,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.maxstep=30 \
     tool.force_noloop=True \
     tool.use_batch_tool_calls=False \
-    tool.env='retro_noback_V2' \
+    tool.env='retro_noback_V4' \
     tool.use_api_model=True \
     tool.api_model_name='$API_MODEL_NAME'" \
     2>&1 | tee "$LOG_FILE"
