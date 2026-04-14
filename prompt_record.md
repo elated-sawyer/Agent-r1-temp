@@ -131,12 +131,69 @@ Currently, `run_llm_loop` (in @agent_r1/llm_agent/generation_retro_noback.py:352
 
 2026-04-14
 
+Strip the codebase down to a **validation-only pipeline using the API model path**. Remove all Ray cluster dependencies and training logic. This is on a dedicated branch (`validation_API`), so aggressive deletion is fine.
 
-Now I have developed the validation with calling API model @prompt_record.md:57-126 , So that, I think ray cluster use is not need anymore, 
-And also I want to delete all the training process, only making it for validation
-I want to clean the whole validation pipeline, 
+## Overview
 
-This would be a huge update on the project, don't worry I have made a new branch
+The current pipeline launches via Ray (`ray.init` → `@ray.remote` → `RayAgentTrainer.fit()`), initializes distributed GPU worker groups, runs a PPO training loop, and periodically calls `_validate()`. Now that we have the `_generate_with_api()` path, none of the Ray/GPU/training machinery is needed. The validation logic itself (`_validate`, `ToolGenerationManager`, `RewardManager`, `ToolRLDataset`, tool environments) is already Ray-independent.
 
+## What to change
 
+### 1. Entry point — @agent_r1/src/main_agent_retro_noback.py
 
+- **Remove** `ray.init()` (line ~116-122), the `@ray.remote` wrapper (line ~127), and `ray.get()` calls.
+- **Remove** all training-specific setup: `reward_fn` (training reward), `train_dataset` creation, critic/ref model resource pool config.
+- **Keep** the Hydra `@hydra.main` config loading, tokenizer/processor initialization (lines ~140-142, these are pure HuggingFace), `val_reward_fn` (`RewardManager`), `val_env` creation, and `val_dataset`/`val_dataloader` setup.
+- The new flow should be: load config → load tokenizer → build val_dataset/dataloader → build val_env → build RewardManager → run validation → print/log results. No Ray, no `fit()`.
+
+### 2. Trainer — @agent_r1/src/agent_ray_trainer_retro_noback.py
+
+**Remove entirely** (these are all training/Ray-only):
+- Ray imports: `import ray`, `RayResourcePool`, `RayWorkerGroup`, `RayClassWithInitArgs`, `create_colocated_worker_cls`
+- Classes/enums: `ResourcePoolManager`, `Role`, `AdvantageEstimator`
+- Functions: `apply_kl_penalty()`, `compute_advantage()`
+- Methods on `RayAgentTrainer`: `init_workers()`, `fit()`, `_balance_batch()`, `prime_norm()`, `_compute_process_rewards()`, `_create_loss_mask()`, `_save_checkpoint()`, `_load_checkpoint()`, `_save_env_var()`
+- Instance variables: `self.critic_wg`, `self.ref_policy_wg`, `self.rm_wg`, `self.actor_rollout_wg`, `self.kl_ctrl`, `self.resource_pool_manager`, `self.role_worker_mapping`, `self.use_critic`, `self.use_rm`, `self.use_reference_policy`, `self.wg_dicts`
+
+**Keep and simplify** `_validate()` (lines ~522-684):
+- **Line ~602**: Replace `pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)` → skip padding entirely (pass `world_size=1`, or remove the pad/unpad calls since API batching doesn't need GPU-divisible sizes).
+- Keep everything else: batch prep, `ToolGenerationManager` construction, `run_llm_loop()`, reward computation, metric aggregation.
+- Keep `_maybe_log_val_generations()` and the `ValidationGenerationsLogger`.
+
+**Rename the class** from `RayAgentTrainer` to something like `ValidationPipeline` — it's no longer a trainer.
+
+### 3. Generation manager — @agent_r1/llm_agent/generation_retro_noback.py
+
+- Make `actor_rollout_wg` **optional** (`None` by default) in `ToolGenerationManager.__init__`.
+- **Remove** `_generate_with_gpu_padding()` entirely (it calls `self.actor_rollout_wg.generate_sequences()` which is a Ray worker call).
+- In `run_llm_loop()`, remove the GPU/API branch — always call `_generate_with_api()`.
+
+### 4. Config — @agent_r1/src/config/agent_trainer.yaml
+
+**Remove** these sections (training-only):
+- `critic:` (entire block, lines ~108-143)
+- `reward_model:` (lines ~145-164)
+- `algorithm:` (lines ~170-178)
+- Training-specific fields under `trainer:`: `total_epochs`, `save_freq`, `test_freq`, `critic_warmup`, `resume_mode`, `resume_from_path`, `remove_previous_ckpt_in_save`, `del_local_ckpt_after_load`
+- Training-specific fields under `actor_rollout_ref:`: `actor.ppo_*`, `actor.grad_clip`, `actor.clip_ratio`, `actor.entropy_coeff`, `actor.use_kl_loss`, `actor.kl_loss_*`, `actor.ppo_epochs`, `actor.fsdp_config`, `actor.optim`, `ref:` (entire block), `rollout.n` / `rollout.n_repeat`
+
+**Keep**:
+- `data:` — `val_files`, `prompt_key`, `max_prompt_length`, `max_response_length`, `max_start_length`, `max_tool_response_length`, `return_raw_chat`
+- `actor_rollout_ref.model.path` — still needed for **tokenizer loading** (not model weights)
+- `actor_rollout_ref.rollout.val_kwargs` — `temperature`, `do_sample`, `n`
+- `tool:` — all fields (this drives the generation loop)
+- `trainer:` — `project_name`, `experiment_name`, `logger`, `val_generations_to_log_to_wandb`, `nnodes`, `n_gpus_per_node` (can default to 1), `val_before_train` (can remove, validation is the only thing)
+- `custom_reward_function:` — used by `RewardManager`
+
+### 5. Sbatch — @test_chembl.sbatch
+
+- **Reduce GPU request**: `--gres=gpu:1` (or `gpu:0` if tokenizer loads on CPU). Validation via API doesn't need local GPUs.
+- **Remove** all actor/critic/ref/reward_model/algorithm Hydra overrides (lines ~52-84).
+- **Keep** data paths, tool config, API model config, project/experiment naming, logger config.
+
+## Constraints
+
+- **Do not change** the tool-calling loop logic in `run_llm_loop()` (tool execution, environment stepping, `_postprocess_responses`, `_update_rolling_state`, etc.).
+- **Do not change** the reward function interface or computation.
+- **Do not change** `ToolRLDataset` or `RewardManager` — they are already Ray-independent.
+- The pipeline must still produce the same `metric_dict` and `envs_var` output from validation.
