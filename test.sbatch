@@ -106,5 +106,5 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     tool.use_batch_tool_calls=False \
     tool.env='retro_noback_V4' \
     tool.use_api_model=True \
-    tool.api_model_name='$API_MODEL_NAME'" \
+    tool.api_model_name='\"$API_MODEL_NAME\"'" \
     2>&1 | tee "$LOG_FILE"
