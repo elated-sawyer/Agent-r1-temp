@@ -136,7 +136,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.test_freq=10 \
     trainer.total_epochs=0 \
     trainer.val_before_train=True \
-    tool.api_max_concurrency=16 \
+    tool.api_max_concurrency=50 \
     tool.debug=True \
     tool.max_turns=100 \
     tool.topk=10 \
