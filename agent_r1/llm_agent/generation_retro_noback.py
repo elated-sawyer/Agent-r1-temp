@@ -16,8 +16,10 @@ from tqdm.auto import tqdm
 
 try:
     from openai import AsyncOpenAI
+    import openai as _openai_module
 except ImportError:
     AsyncOpenAI = None
+    _openai_module = None
 
 from .tensor_helper import TensorHelper, TensorConfig
 # from agent_r1.tool.tool_env import ToolEnv, step, step_batch
@@ -345,18 +347,40 @@ class ToolGenerationManager:
 
         sem = asyncio.Semaphore(self.config.api_max_concurrency)
 
+        _RETRYABLE = tuple(filter(None, [
+            getattr(_openai_module, 'RateLimitError', None),
+            getattr(_openai_module, 'APITimeoutError', None),
+            getattr(_openai_module, 'APIConnectionError', None),
+            getattr(_openai_module, 'InternalServerError', None),
+        ])) if _openai_module else ()
+        _MAX_RETRIES = 10
+        _BASE_WAIT = 5.0
+        _MAX_WAIT = 120.0
+
         async def _call_api(prompt: str) -> str:
-            """Call external API with concurrency limit."""
+            """Call external API with concurrency limit and exponential backoff."""
             async with sem:
-                try:
-                    response = await self._api_client.chat.completions.create(
-                        model=self.config.api_model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=self.config.max_response_length,
-                    )
-                    return response.choices[0].message.content or ""
-                except Exception as exc:
-                    raise RuntimeError(f"API request failed: {type(exc).__name__}: {exc}") from None
+                last_exc = None
+                for attempt in range(_MAX_RETRIES):
+                    try:
+                        response = await self._api_client.chat.completions.create(
+                            model=self.config.api_model_name,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=self.config.max_response_length,
+                        )
+                        return response.choices[0].message.content or ""
+                    except _RETRYABLE as exc:
+                        last_exc = exc
+                        wait = min(_BASE_WAIT * (2 ** attempt), _MAX_WAIT)
+                        wait += random.uniform(0, wait * 0.25)
+                        print(f"[RETRY {attempt+1}/{_MAX_RETRIES}] {type(exc).__name__}: {exc} | "
+                              f"waiting {wait:.1f}s before retry")
+                        await asyncio.sleep(wait)
+                    except Exception as exc:
+                        raise RuntimeError(f"API request failed (non-retryable): {type(exc).__name__}: {exc}") from None
+                raise RuntimeError(
+                    f"API request failed after {_MAX_RETRIES} retries: {type(last_exc).__name__}: {last_exc}"
+                )
 
         async def _call_all():
             return await asyncio.gather(*[_call_api(p) for p in prompts], return_exceptions=True)
