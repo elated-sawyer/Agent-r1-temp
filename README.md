@@ -8,7 +8,7 @@
 ```bash
 git clone -b validation_API --single-branch https://github.com/elated-sawyer/Agent-r1-temp.git 
 cd Retro-R1
-conda env create --file environment.yml  # 不一定需要完整安装此环境（无关 package 较多），可以直接使用已有的能调用 API 的环境，运行时缺什么包再补装即可（大约 3～4 个化学相关的包）
+conda env create --file environment.yml  # 不需要完整安装此环境（无关 package 较多），可以直接使用已有的能调用 API 的环境，运行时缺什么包再补装即可（大约 3～4 个化学相关的包）
 conda activate Retro_R1
 pip install -e packages/mlp_retrosyn
 pip install -e packages/rdchiral
