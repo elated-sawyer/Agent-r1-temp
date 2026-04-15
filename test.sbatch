@@ -13,11 +13,13 @@
 set -eo pipefail
 
 #======================================
-# Dataset selection: "chembl" (default) or "retro"
-# Override via:  sbatch --export=ALL,DATASET=retro test_chembl.sbatch
+# Configurable parameters (override via --export):
+#   sbatch --export=ALL,DATASET=retro,MAX_TURNS=100,FORCE_NOLOOP=True,API_MODEL_NAME=Qwen/Qwen3.5-35B-A3B test.sbatch
 #======================================
-# DATASET="${DATASET:-chembl}"
-DATASET="retro"
+DATASET="${DATASET:-retro}"
+MAX_TURNS="${MAX_TURNS:-100}"
+FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
+API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
 
 case "$DATASET" in
     chembl)
@@ -35,12 +37,9 @@ esac
 EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
 CHECKPOINT_DIR="./checkpoints/retro_qwen2.5-7b-instruct-1M_10_test/${EXPERIMENT_NAME}"
 
-# Qwen/Qwen3.5-35B-A3B
-# ...
-API_MODEL_NAME="Qwen/Qwen3.5-35B-A3B"
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 VAL_TAG="$(basename "$VAL_FILES" .parquet)"
-LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_job-${SLURM_JOB_ID}.log"
+LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_job-${SLURM_JOB_ID}.log"
 mkdir -p logs
 
 #======================================
@@ -66,6 +65,8 @@ echo "VAL_FILES=$VAL_FILES"
 echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
 echo "API_MODEL_NAME=$API_MODEL_NAME"
+echo "MAX_TURNS=$MAX_TURNS"
+echo "FORCE_NOLOOP=$FORCE_NOLOOP"
 echo "LOG_FILE=$LOG_FILE"
 echo "=== Cluster Info ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
@@ -98,11 +99,11 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.nnodes=$NNODES \
     tool.debug=True \
     tool.api_max_concurrency=50 \
-    tool.max_turns=100 \
+    tool.max_turns=$MAX_TURNS \
     tool.topk=10 \
     tool.shuffle=False \
     tool.maxstep=30 \
-    tool.force_noloop=True \
+    tool.force_noloop=$FORCE_NOLOOP \
     tool.use_batch_tool_calls=False \
     tool.env='retro_noback_V4' \
     tool.use_api_model=True \
