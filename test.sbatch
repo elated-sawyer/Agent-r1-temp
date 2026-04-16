@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --partition=ai_science
@@ -14,12 +14,14 @@ set -eo pipefail
 
 #======================================
 # Configurable parameters (override via --export):
-#   sbatch --export=ALL,DATASET=retro,MAX_TURNS=100,FORCE_NOLOOP=True,API_MODEL_NAME=Qwen/Qwen3.5-35B-A3B test.sbatch
+#   sbatch --export=ALL,DATASET=retro,MAX_TURNS=100,FORCE_NOLOOP=True,API_MODEL_NAME=Qwen/Qwen3.5-35B-A3B,API_KEY_VAR=pjlab_APImodel_key_bailian,API_URL_VAR=pjlab_APImodel_url test.sbatch
 #======================================
 DATASET="${DATASET:-retro}"
 MAX_TURNS="${MAX_TURNS:-100}"
 FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
 API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
+API_KEY_VAR="${API_KEY_VAR:-pjlab_APImodel_key}"
+API_URL_VAR="${API_URL_VAR:-pjlab_APImodel_url}"
 
 case "$DATASET" in
     chembl)
@@ -56,8 +58,8 @@ export CPATH="/usr/include:${CPATH:-}"
 export HF_HUB_OFFLINE=1
 
 # API model credentials (set these to use API-based evaluation)
-export pjlab_APImodel_key=$pjlab_APImodel_key
-export pjlab_APImodel_url=$pjlab_APImodel_url
+export pjlab_APImodel_key="${!API_KEY_VAR}"
+export pjlab_APImodel_url="${!API_URL_VAR}"
 
 echo "=== Run Config ==="
 echo "DATASET=$DATASET"
@@ -65,6 +67,8 @@ echo "VAL_FILES=$VAL_FILES"
 echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
 echo "API_MODEL_NAME=$API_MODEL_NAME"
+echo "API_KEY_VAR=$API_KEY_VAR"
+echo "API_URL_VAR=$API_URL_VAR"
 echo "MAX_TURNS=$MAX_TURNS"
 echo "FORCE_NOLOOP=$FORCE_NOLOOP"
 echo "LOG_FILE=$LOG_FILE"
