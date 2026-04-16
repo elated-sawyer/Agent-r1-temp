@@ -14,7 +14,7 @@ set -eo pipefail
 
 #======================================
 # Configurable parameters (override via --export):
-#   sbatch --export=ALL,DATASET=retro,MAX_TURNS=100,FORCE_NOLOOP=True,API_MODEL_NAME=Qwen/Qwen3.5-35B-A3B,API_KEY_VAR=pjlab_APImodel_key_bailian,API_URL_VAR=pjlab_APImodel_url test.sbatch
+#   sbatch --export=ALL,DATASET=retro,MAX_TURNS=100,FORCE_NOLOOP=True,API_MODEL_NAME=Qwen/Qwen3.5-35B-A3B,API_KEY_VAR=pjlab_APImodel_key_bailian test.sbatch
 #======================================
 DATASET="${DATASET:-retro}"
 MAX_TURNS="${MAX_TURNS:-100}"
