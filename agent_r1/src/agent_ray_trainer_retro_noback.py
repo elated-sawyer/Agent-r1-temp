@@ -316,10 +316,14 @@ class ValidationPipeline(object):
                 chunk_idx = chunk_start // val_batch_size
                 chunk_indices = pending[chunk_start:chunk_start + val_batch_size]
                 chunk_keys = [keys[i] for i in chunk_indices]
-                # Use a Python list of indices to preserve batch semantics even
-                # when a chunk has exactly one sample (np.array can return
-                # DataProtoItem for length-1 indexing in some verl versions).
-                chunk_batch = full_batch[chunk_indices]
+                # Some verl versions return DataProtoItem for length-1 advanced
+                # indexing, which does not implement `.pop`. Force slice-based
+                # indexing for singleton chunks to keep a DataProto object.
+                if len(chunk_indices) == 1:
+                    idx = int(chunk_indices[0])
+                    chunk_batch = full_batch[idx:idx + 1]
+                else:
+                    chunk_batch = full_batch[chunk_indices]
                 chunk_size_now = len(chunk_indices)
 
                 envs = [
