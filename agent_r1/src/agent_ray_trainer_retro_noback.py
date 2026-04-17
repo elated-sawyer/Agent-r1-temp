@@ -20,7 +20,6 @@ import os
 from pprint import pprint
 
 import numpy as np
-import torch
 from omegaconf import OmegaConf
 from verl import DataProto
 from .agent_rl_dataset import ToolRLDataset, collate_fn
@@ -34,6 +33,7 @@ from tqdm.auto import tqdm
 from filelock import FileLock
 import tempfile
 import pickle
+import hashlib
 
 
 class ValidationPipeline(object):
@@ -123,17 +123,104 @@ class ValidationPipeline(object):
             print(f"Warning: Failed to acquire lock for {local_global_step_folder}: {e}")
             os.makedirs(local_global_step_folder, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Crash-safe / resumable validation helpers
+    # ------------------------------------------------------------------
+
+    def _val_shard_dir(self):
+        """Directory holding per-sample shard pickles for the current step."""
+        override = self.config.trainer.get('val_shard_dir', None)
+        if override:
+            return override
+        return os.path.join(
+            self.config.trainer.default_local_dir,
+            f'global_step_{self.global_steps}',
+            'val_shards',
+        )
+
+    def _compute_stable_keys(self, non_tensor_batch, total_n, copies_per_sample):
+        """Return one stable filename-safe key per expanded sample position.
+
+        Identifier preference (stable across reruns of the same dataset):
+          1. ``non_tensor_batch['idx']`` if present,
+          2. ``non_tensor_batch['index']`` (ToolRLDataset copies this from
+             ``extra_info.index`` during preprocessing),
+          3. SHA-1 of ``(data_source | target | raw_prompt_ids)`` as a fallback.
+        A ``_c{copy_idx}`` suffix distinguishes the n copies created by
+        ``val_kwargs.n`` so they do not collide on disk.
+        """
+        explicit_field = None
+        for f in ('idx', 'index'):
+            if f in non_tensor_batch:
+                explicit_field = f
+                break
+
+        keys = []
+        for i in range(total_n):
+            copy_idx = i % max(copies_per_sample, 1)
+            h = hashlib.sha1()
+            if explicit_field is not None:
+                h.update(b'explicit:')
+                h.update(str(non_tensor_batch[explicit_field][i]).encode())
+            else:
+                for fld in ('data_source', 'target'):
+                    val = non_tensor_batch.get(fld, None)
+                    if val is not None:
+                        h.update(str(val[i]).encode())
+                    h.update(b'|')
+                if 'raw_prompt_ids' in non_tensor_batch:
+                    raw = non_tensor_batch['raw_prompt_ids'][i]
+                    # raw_prompt_ids is a list/array of int token ids which may
+                    # exceed 255, so bytes(raw) is unsafe — serialize textually.
+                    try:
+                        h.update(','.join(str(int(x)) for x in raw).encode())
+                    except (TypeError, ValueError):
+                        h.update(str(raw).encode())
+            keys.append(f"{h.hexdigest()[:16]}_c{copy_idx}")
+        return keys
+
+    @staticmethod
+    def _shard_path(shard_dir, key):
+        return os.path.join(shard_dir, f'sample_{key}.pkl')
+
+    def _write_shard(self, shard_dir, key, record):
+        """Atomically persist a single-sample record (tmp + os.replace)."""
+        os.makedirs(shard_dir, exist_ok=True)
+        final = self._shard_path(shard_dir, key)
+        tmp = final + '.tmp'
+        with open(tmp, 'wb') as f:
+            pickle.dump(record, f)
+        os.replace(tmp, final)
+
+    def _load_shards(self, shard_dir):
+        """Return {key: record} for every ``sample_*.pkl`` in ``shard_dir``."""
+        if not os.path.isdir(shard_dir):
+            return {}
+        out = {}
+        for fname in os.listdir(shard_dir):
+            if not (fname.startswith('sample_') and fname.endswith('.pkl')):
+                continue
+            key = fname[len('sample_'):-len('.pkl')]
+            try:
+                with open(os.path.join(shard_dir, fname), 'rb') as f:
+                    out[key] = pickle.load(f)
+            except Exception as e:
+                print(f"[Resume] Ignoring unreadable shard {fname}: {e}")
+        return out
+
+    def _clear_shards(self, shard_dir):
+        if not os.path.isdir(shard_dir):
+            return
+        for fname in os.listdir(shard_dir):
+            if fname.startswith('sample_') and (fname.endswith('.pkl') or fname.endswith('.pkl.tmp')):
+                try:
+                    os.remove(os.path.join(shard_dir, fname))
+                except OSError:
+                    pass
+
     def validate(self):
         import time
         val_start_time = time.time()
-        reward_tensor_lst = []
-        turns_lst = []
-        data_source_lst = []
-
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
 
         # Agent config preparation
         gen_config = ToolGenerationConfig(
@@ -161,100 +248,194 @@ class ValidationPipeline(object):
             is_validation=True,
         )
 
-        envs_var = []
-        total_samples_done = 0
-        running_acc = []
-        val_pbar = tqdm(self.val_dataloader, desc="Validation batches", leave=True)
-        for batch_idx, test_data in enumerate(val_pbar):
-            test_batch = DataProto.from_single_dict(test_data)
+        # --- Shard dir + resume handling ---
+        shard_dir = self._val_shard_dir()
+        val_resume = bool(self.config.trainer.get('val_resume', True))
+        if not val_resume:
+            self._clear_shards(shard_dir)
+        os.makedirs(shard_dir, exist_ok=True)
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                                           interleave=True)
-            envs = [self.val_env.copy(test_batch.non_tensor_batch['target'][ii]) for ii in range(len(test_batch))]
+        # --- Build the full validation batch (single DataLoader iteration). ---
+        assert len(self.val_dataloader) == 1, (
+            "Validation dataloader must have a single batch; chunking is applied "
+            "inside validate() via data.val_batch_size."
+        )
+        test_data = next(iter(self.val_dataloader))
+        full_batch = DataProto.from_single_dict(test_data)
+        n_copies = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+        full_batch = full_batch.repeat(repeat_times=n_copies, interleave=True)
+        total_n = len(full_batch)
 
-            # Store original inputs
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+        # Stable keys are computed on the full repeated batch before any pop,
+        # while raw_prompt_ids is still available as a fallback hash input.
+        keys = self._compute_stable_keys(full_batch.non_tensor_batch, total_n, n_copies)
+        assert len(set(keys)) == len(keys), (
+            "Stable key collision detected — dataset has duplicate samples with no "
+            "distinguishing 'idx'/'index' field. Add a unique 'index' in preprocessing."
+        )
 
-            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+        # --- Identify completed vs. pending samples. ---
+        completed = self._load_shards(shard_dir) if val_resume else {}
+        # Drop any completed shard that does not correspond to a current-dataset key
+        # (e.g. the dataset changed between runs). These are not trustworthy to reuse.
+        key_set = set(keys)
+        stale = [k for k in completed.keys() if k not in key_set]
+        for k in stale:
+            completed.pop(k, None)
+        pending = [i for i, k in enumerate(keys) if k not in completed]
+
+        val_batch_size = int(self.config.data.get('val_batch_size', 64))
+
+        print(
+            f'[Validation] total={total_n}, completed={len(completed)}, '
+            f'pending={len(pending)}, chunk_size={val_batch_size}, '
+            f'shard_dir={shard_dir}'
+        )
+
+        # --- Chunk loop. Skipped entirely if everything is already on disk. ---
+        running_acc = [rec['answer'] for rec in completed.values()]
+        total_samples_done = len(completed)
+
+        val_pbar = tqdm(
+            total=total_n,
+            initial=total_samples_done,
+            desc='Validation samples',
+            leave=True,
+        )
+        meta_info = {
+            'eos_token_id': self.tokenizer.eos_token_id,
+            'pad_token_id': self.tokenizer.pad_token_id,
+            'recompute_log_prob': False,
+            'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+            'validate': True,
+        }
+        first_chunk_log = True
+
+        try:
+            for chunk_start in range(0, len(pending), val_batch_size):
+                chunk_idx = chunk_start // val_batch_size
+                chunk_indices = pending[chunk_start:chunk_start + val_batch_size]
+                chunk_keys = [keys[i] for i in chunk_indices]
+                chunk_batch = full_batch[np.array(chunk_indices, dtype=np.int64)]
+
+                envs = [
+                    self.val_env.copy(chunk_batch.non_tensor_batch['target'][j])
+                    for j in range(len(chunk_batch))
+                ]
+
+                # Capture input texts before pop removes input_ids.
+                input_ids = chunk_batch.batch['input_ids']
+                input_texts = [
+                    self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids
+                ]
+
+                if 'multi_modal_inputs' in chunk_batch.non_tensor_batch.keys():
+                    chunk_gen_batch = chunk_batch.pop(
+                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                    )
+                else:
+                    chunk_gen_batch = chunk_batch.pop(
+                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids'],
+                    )
+                chunk_gen_batch.meta_info = meta_info
+                if first_chunk_log:
+                    print(f'test_gen_batch meta info: {chunk_gen_batch.meta_info}')
+                    first_chunk_log = False
+
+                first_input_ids = chunk_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+                chunk_size_now = len(chunk_batch)
+                val_pbar.set_postfix(batch_samples=chunk_size_now, total_done=total_samples_done)
+
+                gen_start_time = time.time()
+                chunk_output_gen_batch = generation_manager.run_llm_loop(
+                    chunk_gen_batch,
+                    envs=envs,
+                    initial_input_ids=first_input_ids,
                 )
-            else:
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids'],
+                gen_elapsed = time.time() - gen_start_time
+                print(
+                    f'[Validation chunk {chunk_idx}] Generation complete in '
+                    f'{gen_elapsed:.1f}s. Computing rewards...'
                 )
 
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                'validate': True,
-            }
-            if batch_idx == 0:
-                print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+                for key_t in chunk_output_gen_batch.batch.keys():
+                    chunk_output_gen_batch.batch[key_t] = chunk_output_gen_batch.batch[key_t].long()
 
-            # No padding needed for API-based generation (no GPU-divisible size requirement)
-            first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-            batch_size = len(test_batch)
-            val_pbar.set_postfix(batch_samples=batch_size, total_done=total_samples_done)
-            gen_start_time = time.time()
-            test_output_gen_batch = generation_manager.run_llm_loop(
-                test_gen_batch,
-                envs=envs,
-                initial_input_ids=first_input_ids,
-            )
+                output_ids = chunk_output_gen_batch.batch['responses']
+                output_texts = [
+                    self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids
+                ]
 
-            gen_elapsed = time.time() - gen_start_time
-            print(f'[Validation batch {batch_idx}] Generation complete in {gen_elapsed:.1f}s. Computing rewards...')
+                chunk_batch_merged = chunk_batch.union(chunk_output_gen_batch)
 
-            for key in test_output_gen_batch.batch.keys():
-                test_output_gen_batch.batch[key] = test_output_gen_batch.batch[key].long()
+                # Reward-function errors must not silently exit — propagate so
+                # Slurm records a non-zero exit, shards already flushed persist.
+                reward_tensor, end_lst, answer_lst, format_lst = self.val_reward_fn(
+                    chunk_batch_merged, envs
+                )
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                turns_tensor = chunk_batch_merged.batch['turns']
+                data_sources_chunk = chunk_batch_merged.non_tensor_batch.get(
+                    'data_source', np.array(['unknown'] * reward_tensor.shape[0], dtype=object)
+                )
+                reward_scalar = reward_tensor.sum(-1).cpu()
 
-            test_batch = test_batch.union(test_output_gen_batch)
+                # Persist one shard per sample — atomic writes, so a crash after
+                # any shard completes leaves that shard intact on disk.
+                for j, k in enumerate(chunk_keys):
+                    record = {
+                        'env_var': envs[j].get_tracking_variables(),
+                        'reward': float(reward_scalar[j].item()),
+                        'turns': int(turns_tensor[j].item()),
+                        'end': end_lst[j],
+                        'answer': answer_lst[j],
+                        'format': format_lst[j],
+                        'data_source': str(data_sources_chunk[j]),
+                        'input_text': input_texts[j],
+                        'output_text': output_texts[j],
+                    }
+                    self._write_shard(shard_dir, k, record)
+                    running_acc.append(answer_lst[j])
 
-            # evaluate using reward_function
-            try:
-                reward_tensor, end_lst, answer_lst, format_lst = self.val_reward_fn(test_batch, envs)
-            except:
-                print(f"[Error] Something wrong with the reward function")
-                print(test_batch)
-                exit()
-
-            # Store scores
-            sample_scores.extend(answer_lst)
-            total_samples_done += batch_size
-            running_acc.extend(answer_lst)
-            val_pbar.set_postfix(
-                total_done=total_samples_done,
-                acc=f"{np.mean(running_acc):.4f}",
-                last_gen=f"{gen_elapsed:.1f}s",
-            )
-
-            reward_tensor_lst.append(reward_tensor)
-            turns_lst.append(test_batch.batch['turns'])
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-
-            envs_var += [env.get_tracking_variables() for env in envs]
+                total_samples_done += chunk_size_now
+                val_pbar.update(chunk_size_now)
+                val_pbar.set_postfix(
+                    total_done=total_samples_done,
+                    acc=f"{np.mean(running_acc):.4f}" if running_acc else "n/a",
+                    last_gen=f"{gen_elapsed:.1f}s",
+                )
+        except Exception as e:
+            print(f"[Error] Validation aborted; {total_samples_done}/{total_n} samples checkpointed. Reason: {e}")
+            val_pbar.close()
+            raise
 
         val_pbar.close()
 
+        # --- Rehydrate everything in dataset order from on-disk shards. ---
+        all_shards = self._load_shards(shard_dir)
+        missing = [k for k in keys if k not in all_shards]
+        if missing:
+            raise RuntimeError(
+                f"[Validation] {len(missing)} shard(s) missing after chunk loop; "
+                f"first few: {missing[:5]}"
+            )
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        envs_var = [all_shards[k]['env_var'] for k in keys]
+        sample_inputs = [all_shards[k]['input_text'] for k in keys]
+        sample_outputs = [all_shards[k]['output_text'] for k in keys]
+        sample_scores = [all_shards[k]['answer'] for k in keys]
+        reward_per_sample = [all_shards[k]['reward'] for k in keys]
+        turns_per_sample = [all_shards[k]['turns'] for k in keys]
+        end_per_sample = [all_shards[k]['end'] for k in keys]
+        answer_per_sample = [all_shards[k]['answer'] for k in keys]
+        format_per_sample = [all_shards[k]['format'] for k in keys]
+        data_source_per_sample = [all_shards[k]['data_source'] for k in keys]
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        turns_tensor = torch.cat(turns_lst, dim=0).cpu()
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores
+        )
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -262,23 +443,13 @@ class ValidationPipeline(object):
         data_source_answer = {}
         data_source_format = {}
         data_source_turns = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
-            if data_source not in data_source_end:
-                data_source_end[data_source] = []
-            data_source_end[data_source].append(end_lst[i])
-            if data_source not in data_source_answer:
-                data_source_answer[data_source] = []
-            data_source_answer[data_source].append(answer_lst[i])
-            if data_source not in data_source_format:
-                data_source_format[data_source] = []
-            data_source_format[data_source].append(format_lst[i])
-            if data_source not in data_source_turns:
-                data_source_turns[data_source] = []
-            data_source_turns[data_source].append(turns_tensor[i])
+        for i in range(total_n):
+            data_source = data_source_per_sample[i]
+            data_source_reward.setdefault(data_source, []).append(reward_per_sample[i])
+            data_source_end.setdefault(data_source, []).append(end_per_sample[i])
+            data_source_answer.setdefault(data_source, []).append(answer_per_sample[i])
+            data_source_format.setdefault(data_source, []).append(format_per_sample[i])
+            data_source_turns.setdefault(data_source, []).append(turns_per_sample[i])
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
@@ -291,8 +462,7 @@ class ValidationPipeline(object):
             metric_dict[f'val/format_score/{data_source}'] = np.mean(formats)
         for data_source, turns in data_source_turns.items():
             metric_dict[f'val/turns/{data_source}'] = np.mean(turns)
-        total_samples = reward_tensor.shape[0]
-        print(f'[Validation] Completed in {time.time() - val_start_time:.1f}s — {total_samples} samples')
+        print(f'[Validation] Completed in {time.time() - val_start_time:.1f}s — {total_n} samples')
         return metric_dict, envs_var
 
     def run(self):
