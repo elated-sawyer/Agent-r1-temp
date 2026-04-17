@@ -367,6 +367,9 @@ class ToolGenerationManager:
                             model=self.config.api_model_name,
                             messages=[{"role": "user", "content": prompt}],
                             max_tokens=self.config.max_response_length,
+                            temperature=0.0,
+                            top_p=1.0,
+                            n=1,
                         )
                         return response.choices[0].message.content or ""
                     except _RETRYABLE as exc:
