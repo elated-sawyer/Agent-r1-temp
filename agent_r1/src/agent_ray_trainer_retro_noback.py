@@ -316,7 +316,7 @@ class ValidationPipeline(object):
                 chunk_idx = chunk_start // val_batch_size
                 chunk_indices = pending[chunk_start:chunk_start + val_batch_size]
                 chunk_keys = [keys[i] for i in chunk_indices]
-                chunk_batch = full_batch[np.array(chunk_indices, dtype=np.int64)]
+                chunk_batch = full_batch.select_idxs(np.array(chunk_indices, dtype=np.int64))
 
                 envs = [
                     self.val_env.copy(chunk_batch.non_tensor_batch['target'][j])
