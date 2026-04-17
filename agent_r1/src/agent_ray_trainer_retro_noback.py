@@ -316,11 +316,15 @@ class ValidationPipeline(object):
                 chunk_idx = chunk_start // val_batch_size
                 chunk_indices = pending[chunk_start:chunk_start + val_batch_size]
                 chunk_keys = [keys[i] for i in chunk_indices]
-                chunk_batch = full_batch[np.array(chunk_indices, dtype=np.int64)]
+                # Use a Python list of indices to preserve batch semantics even
+                # when a chunk has exactly one sample (np.array can return
+                # DataProtoItem for length-1 indexing in some verl versions).
+                chunk_batch = full_batch[chunk_indices]
+                chunk_size_now = len(chunk_indices)
 
                 envs = [
                     self.val_env.copy(chunk_batch.non_tensor_batch['target'][j])
-                    for j in range(len(chunk_batch))
+                    for j in range(chunk_size_now)
                 ]
 
                 # Capture input texts before pop removes input_ids.
@@ -345,7 +349,6 @@ class ValidationPipeline(object):
                     first_chunk_log = False
 
                 first_input_ids = chunk_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-                chunk_size_now = len(chunk_batch)
                 val_pbar.set_postfix(batch_samples=chunk_size_now, total_done=total_samples_done)
 
                 gen_start_time = time.time()
