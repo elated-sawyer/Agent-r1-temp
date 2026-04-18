@@ -102,7 +102,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
     tool.debug=True \
-    tool.api_max_concurrency=50 \
+    tool.api_max_concurrency=32 \
     tool.max_turns=$MAX_TURNS \
     tool.topk=10 \
     tool.shuffle=False \
