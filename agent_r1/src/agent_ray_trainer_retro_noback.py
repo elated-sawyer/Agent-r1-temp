@@ -18,6 +18,8 @@ All Ray cluster dependencies and training logic have been removed.
 
 import os
 from pprint import pprint
+import glob
+import shutil
 
 import numpy as np
 import torch
@@ -68,20 +70,17 @@ class ValidationPipeline(object):
             tool_env=self.val_env,
             use_custom_tool_format_func=self.config.data.get('use_custom_tool_format_func', False),
         )
+        val_batch_size = int(self.config.data.get('val_batch_size', 64))
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
-            # Validation datasets are sent to inference engines as a whole batch,
-            # which will schedule the memory themselves.
-            batch_size=len(self.val_dataset),
+            batch_size=val_batch_size,
             num_workers=8,
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn,
         )
-
-        assert len(
-            self.val_dataloader
-        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+        self.val_total_samples = len(self.val_dataset)
+        self.val_num_chunks = len(self.val_dataloader)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -123,17 +122,49 @@ class ValidationPipeline(object):
             print(f"Warning: Failed to acquire lock for {local_global_step_folder}: {e}")
             os.makedirs(local_global_step_folder, exist_ok=True)
 
+    def _resolve_shard_dir(self):
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir,
+            f'global_step_{self.global_steps}',
+        )
+        override_dir = self.config.trainer.get('val_shard_dir', None)
+        if override_dir is not None:
+            return override_dir
+        return os.path.join(local_global_step_folder, 'val_shards')
+
+    def _scan_done_chunks(self, shard_dir):
+        chunk_payloads = {}
+        pattern = os.path.join(shard_dir, 'chunk_*.pkl')
+        for chunk_path in sorted(glob.glob(pattern)):
+            chunk_name = os.path.basename(chunk_path)
+            try:
+                chunk_idx = int(chunk_name.replace('chunk_', '').replace('.pkl', ''))
+            except ValueError:
+                continue
+            with open(chunk_path, 'rb') as f:
+                chunk_payloads[chunk_idx] = pickle.load(f)
+        return chunk_payloads
+
+    def _write_chunk(self, shard_dir, chunk_idx, payload):
+        lock_filename = f"val_shard_{hash(shard_dir) & 0xFFFFFFFF:08x}.lock"
+        lock_path = os.path.join(tempfile.gettempdir(), lock_filename)
+        final_path = os.path.join(shard_dir, f'chunk_{chunk_idx:05d}.pkl')
+        tmp_path = f'{final_path}.tmp'
+        with FileLock(lock_path, timeout=60):
+            os.makedirs(shard_dir, exist_ok=True)
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(payload, f)
+            os.replace(tmp_path, final_path)
+
     def validate(self):
         import time
         val_start_time = time.time()
-        reward_tensor_lst = []
-        turns_lst = []
-        data_source_lst = []
-
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
+        shard_dir = self._resolve_shard_dir()
+        if not self.config.trainer.get('val_resume', True):
+            shutil.rmtree(shard_dir, ignore_errors=True)
+        os.makedirs(shard_dir, exist_ok=True)
+        done_flag_path = os.path.join(shard_dir, 'DONE')
+        done_chunks = self._scan_done_chunks(shard_dir)
 
         # Agent config preparation
         gen_config = ToolGenerationConfig(
@@ -161,100 +192,131 @@ class ValidationPipeline(object):
             is_validation=True,
         )
 
-        envs_var = []
-        total_samples_done = 0
-        running_acc = []
-        val_pbar = tqdm(self.val_dataloader, desc="Validation batches", leave=True)
-        for batch_idx, test_data in enumerate(val_pbar):
-            test_batch = DataProto.from_single_dict(test_data)
-
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                                           interleave=True)
-            envs = [self.val_env.copy(test_batch.non_tensor_batch['target'][ii]) for ii in range(len(test_batch))]
-
-            # Store original inputs
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-
-            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
-                )
-            else:
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids'],
-                )
-
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                'validate': True,
-            }
-            if batch_idx == 0:
-                print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
-
-            # No padding needed for API-based generation (no GPU-divisible size requirement)
-            first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-            batch_size = len(test_batch)
-            val_pbar.set_postfix(batch_samples=batch_size, total_done=total_samples_done)
-            gen_start_time = time.time()
-            test_output_gen_batch = generation_manager.run_llm_loop(
-                test_gen_batch,
-                envs=envs,
-                initial_input_ids=first_input_ids,
+        if os.path.exists(done_flag_path) and self.config.trainer.get('val_resume', True):
+            print(f'[Validation] DONE sentinel found at {done_flag_path}, loading shard cache only.')
+        else:
+            val_batch_size = int(self.config.data.get('val_batch_size', 64))
+            total_done_samples = sum(len(chunk['sample_indices']) for chunk in done_chunks.values())
+            all_done_answers = [score for chunk in done_chunks.values() for score in chunk['answer_lst']]
+            val_pbar = tqdm(
+                total=self.val_total_samples,
+                initial=total_done_samples,
+                desc="Validation samples",
+                leave=True,
             )
+            for chunk_idx, test_data in enumerate(self.val_dataloader):
+                chunk_sample_count = len(test_data['input_ids'])
+                if chunk_idx in done_chunks:
+                    continue
 
-            gen_elapsed = time.time() - gen_start_time
-            print(f'[Validation batch {batch_idx}] Generation complete in {gen_elapsed:.1f}s. Computing rewards...')
+                test_batch = DataProto.from_single_dict(test_data)
 
-            for key in test_output_gen_batch.batch.keys():
-                test_output_gen_batch.batch[key] = test_output_gen_batch.batch[key].long()
+                # repeat test batch
+                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                                               interleave=True)
+                envs = [self.val_env.copy(test_batch.non_tensor_batch['target'][ii]) for ii in range(len(test_batch))]
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+                # Store original inputs
+                input_ids = test_batch.batch['input_ids']
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
 
-            test_batch = test_batch.union(test_output_gen_batch)
+                if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
+                    test_gen_batch = test_batch.pop(
+                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                    )
+                else:
+                    test_gen_batch = test_batch.pop(
+                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids'],
+                    )
 
-            # evaluate using reward_function
-            try:
-                reward_tensor, end_lst, answer_lst, format_lst = self.val_reward_fn(test_batch, envs)
-            except:
-                print(f"[Error] Something wrong with the reward function")
-                print(test_batch)
-                exit()
+                test_gen_batch.meta_info = {
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'pad_token_id': self.tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    'validate': True,
+                }
+                if chunk_idx == 0:
+                    print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
-            # Store scores
-            sample_scores.extend(answer_lst)
-            total_samples_done += batch_size
-            running_acc.extend(answer_lst)
-            val_pbar.set_postfix(
-                total_done=total_samples_done,
-                acc=f"{np.mean(running_acc):.4f}",
-                last_gen=f"{gen_elapsed:.1f}s",
-            )
+                # No padding needed for API-based generation (no GPU-divisible size requirement)
+                first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+                gen_start_time = time.time()
+                test_output_gen_batch = generation_manager.run_llm_loop(
+                    test_gen_batch,
+                    envs=envs,
+                    initial_input_ids=first_input_ids,
+                )
 
-            reward_tensor_lst.append(reward_tensor)
-            turns_lst.append(test_batch.batch['turns'])
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                gen_elapsed = time.time() - gen_start_time
+                print(f'[Validation chunk {chunk_idx}] Generation complete in {gen_elapsed:.1f}s. Computing rewards...')
 
-            envs_var += [env.get_tracking_variables() for env in envs]
+                for key in test_output_gen_batch.batch.keys():
+                    test_output_gen_batch.batch[key] = test_output_gen_batch.batch[key].long()
 
-        val_pbar.close()
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch['responses']
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
 
+                test_batch = test_batch.union(test_output_gen_batch)
+
+                # evaluate using reward_function
+                try:
+                    reward_tensor, end_lst, answer_lst, format_lst = self.val_reward_fn(test_batch, envs)
+                except Exception:
+                    print(f"[Error] Something wrong with the reward function")
+                    print(test_batch)
+                    exit()
+
+                all_done_answers.extend(answer_lst)
+                val_pbar.update(chunk_sample_count)
+                val_pbar.set_postfix(
+                    chunk=f"{chunk_idx + 1}/{self.val_num_chunks}",
+                    acc=f"{np.mean(all_done_answers):.4f}" if all_done_answers else "nan",
+                    last_gen=f"{gen_elapsed:.1f}s",
+                )
+
+                chunk_payload = {
+                    'chunk_idx': chunk_idx,
+                    'sample_indices': list(range(
+                        chunk_idx * val_batch_size,
+                        min(chunk_idx * val_batch_size + chunk_sample_count, self.val_total_samples),
+                    )),
+                    'envs_var': [env.get_tracking_variables() for env in envs],
+                    'reward_tensor': reward_tensor.cpu(),
+                    'turns_tensor': test_batch.batch['turns'].cpu(),
+                    'data_sources': list(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])),
+                    'end_lst': end_lst,
+                    'answer_lst': answer_lst,
+                    'format_lst': format_lst,
+                    'sample_inputs': input_texts,
+                    'sample_outputs': output_texts,
+                    'sample_scores': answer_lst,
+                }
+                self._write_chunk(shard_dir, chunk_idx, chunk_payload)
+                done_chunks[chunk_idx] = chunk_payload
+            val_pbar.close()
+
+        chunks_sorted = [done_chunks[i] for i in sorted(done_chunks)]
+        if len(chunks_sorted) == 0:
+            raise RuntimeError("No validation chunks available for aggregation.")
+
+        reward_tensor = torch.cat([chunk['reward_tensor'] for chunk in chunks_sorted], dim=0).sum(-1)
+        turns_tensor = torch.cat([chunk['turns_tensor'] for chunk in chunks_sorted], dim=0)
+        data_sources = np.array([source for chunk in chunks_sorted for source in chunk['data_sources']])
+        end_lst = [item for chunk in chunks_sorted for item in chunk['end_lst']]
+        answer_lst = [item for chunk in chunks_sorted for item in chunk['answer_lst']]
+        format_lst = [item for chunk in chunks_sorted for item in chunk['format_lst']]
+        envs_var = [item for chunk in chunks_sorted for item in chunk['envs_var']]
+        sample_inputs = [item for chunk in chunks_sorted for item in chunk['sample_inputs']]
+        sample_outputs = [item for chunk in chunks_sorted for item in chunk['sample_outputs']]
+        sample_scores = [item for chunk in chunks_sorted for item in chunk['sample_scores']]
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        turns_tensor = torch.cat(turns_lst, dim=0).cpu()
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        reward_tensor = reward_tensor.cpu()
+        turns_tensor = turns_tensor.cpu()
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -292,6 +354,10 @@ class ValidationPipeline(object):
         for data_source, turns in data_source_turns.items():
             metric_dict[f'val/turns/{data_source}'] = np.mean(turns)
         total_samples = reward_tensor.shape[0]
+        self._save_env_var(envs_var)
+        with FileLock(os.path.join(tempfile.gettempdir(), f"val_shard_{hash(shard_dir) & 0xFFFFFFFF:08x}.lock"), timeout=60):
+            with open(done_flag_path, 'w'):
+                pass
         print(f'[Validation] Completed in {time.time() - val_start_time:.1f}s — {total_samples} samples')
         return metric_dict, envs_var
 
@@ -304,7 +370,6 @@ class ValidationPipeline(object):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        val_metrics, val_env_list = self.validate()
-        self._save_env_var(val_env_list)
+        val_metrics, _ = self.validate()
         pprint(f'Validation metrics: {val_metrics}')
         logger.log(data=val_metrics, step=self.global_steps)
