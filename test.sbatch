@@ -19,6 +19,8 @@ set -eo pipefail
 DATASET="${DATASET:-retro}"
 MAX_TURNS="${MAX_TURNS:-100}"
 FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
+VAL_RESUME="${VAL_RESUME:-True}"
 API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
 API_KEY_VAR="${API_KEY_VAR:-pjlab_APImodel_key}"
 API_URL_VAR="${API_URL_VAR:-pjlab_APImodel_url}"
@@ -71,6 +73,8 @@ echo "API_KEY_VAR=$API_KEY_VAR"
 echo "API_URL_VAR=$API_URL_VAR"
 echo "MAX_TURNS=$MAX_TURNS"
 echo "FORCE_NOLOOP=$FORCE_NOLOOP"
+echo "VAL_BATCH_SIZE=$VAL_BATCH_SIZE"
+echo "VAL_RESUME=$VAL_RESUME"
 echo "LOG_FILE=$LOG_FILE"
 echo "=== Cluster Info ==="
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
@@ -91,6 +95,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     data.max_response_length=32768 \
     data.max_start_length=1024 \
     data.max_tool_response_length=4096 \
+    data.val_batch_size=$VAL_BATCH_SIZE \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False \
@@ -101,6 +106,7 @@ srun env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
+    trainer.val_resume=$VAL_RESUME \
     tool.debug=True \
     tool.api_max_concurrency=32 \
     tool.max_turns=$MAX_TURNS \
