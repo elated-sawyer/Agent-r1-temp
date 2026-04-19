@@ -267,32 +267,6 @@ Make the validation-only pipeline in `ValidationPipeline.validate()` (`agent_r1/
 3. **Resumable re-launch.** On startup, detect already-completed samples from the on-disk state and skip them; only unfinished samples are sent to the API. If a previous run finished completely, re-launching should be a no-op (or just recompute aggregate metrics).
 4. **Final aggregation unchanged.** The final `metric_dict` (per `data_source` reward / end / answer / format / turns means) and the wandb `validation_generations` table must be identical in shape/semantics to the current implementation when a run completes without crashes. A final consolidated `val_env_var.pkl` (the list that today is written once) should still exist at the end for backward compatibility with downstream tooling that already reads it.
 
-## Suggested implementation outline (follow unless you see a clearly better design)
-
-- Add config knobs (with sensible defaults so existing sbatch keeps working):
-  - `data.val_batch_size` (int, default `64`).
-  - `trainer.val_resume` (bool, default `True`).
-  - Optionally `trainer.val_shard_dir` (path, default `{default_local_dir}/global_step_{global_steps}/val_shards/`).
-- Identify each sample by a **stable key** (not row index, which can shift if the dataset changes). Prefer `non_tensor_batch['idx']` if present, else a hash of `(data_source, target, prompt)`. Document the choice in a comment.
-- Storage layout under `val_shard_dir/`:
-  - `sample_{stable_key}.pkl` — one file per completed sample containing `{ "env_var": ..., "reward": ..., "turns": ..., "end": ..., "answer": ..., "format": ..., "data_source": ..., "input_text": ..., "output_text": ... }`.
-  - Write atomically: write to `*.tmp` then `os.replace(tmp, final)`. Keep the existing `FileLock` pattern for the consolidated pickle.
-- Resume logic at the top of `validate()`:
-  - Scan `val_shard_dir/` for existing `sample_*.pkl`, load them into memory as the seed of `envs_var`, `reward_tensor_lst`, `answer_lst`, etc.
-  - Build the list of pending sample keys = all dataset keys − completed keys.
-  - If pending is empty: skip generation entirely and jump straight to aggregation.
-- Chunk loop (replaces the current single-batch loop around lines 168–248):
-  - Slice the pending list into chunks of `val_batch_size`.
-  - For each chunk, build a mini `DataProto` (reuse the existing `repeat` / `pop` / meta_info setup), run `generation_manager.run_llm_loop`, compute rewards, then immediately dump per-sample shard files.
-  - Update running `val_pbar` postfix the same way as today (`total_done`, `acc`, `last_gen`).
-- Robustness:
-  - Wrap each chunk in `try/except`. On exception, log it, flush any already-written shards (they should already be on disk thanks to atomic writes), and re-raise so Slurm sees a non-zero exit.
-  - Do **not** call `exit()` on reward-function errors (the current `except: ... exit()` at ~line 229-232 silently kills the program — replace with a logged exception that still preserves shards).
-- At the end of `validate()`:
-  - Reconstruct `envs_var` in dataset order by loading all shards keyed by stable key.
-  - Write the consolidated `val_env_var.pkl` exactly as today (so downstream readers of `checkpoints/.../global_step_0/val_env_var.pkl` keep working).
-  - Compute and return `metric_dict` as today.
-
 ## Acceptance criteria
 
 - Running `sbatch test.sbatch` with the current default config produces the same final `val_env_var.pkl` content (same length, same per-sample fields) as before, plus a populated `val_shard_dir/`.
