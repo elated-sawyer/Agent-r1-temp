@@ -42,7 +42,12 @@ esac
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 VAL_TAG="$(basename "$VAL_FILES" .parquet)"
 EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
-CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_job-${SLURM_JOB_ID}"
+# Stable path (no SLURM_JOB_ID): validation shards live under
+#   $CHECKPOINT_DIR/global_step_0/val_shards/
+# so resubmitting the same job config resumes from chunk_*.pkl when VAL_RESUME=True.
+# Override for manual resume: sbatch --export=ALL,CHECKPOINT_DIR=/path/to/previous/run ...
+DEFAULT_CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$DEFAULT_CHECKPOINT_DIR}"
 LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_job-${SLURM_JOB_ID}.log"
 mkdir -p logs
 
