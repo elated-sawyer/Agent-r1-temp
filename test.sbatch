@@ -2,10 +2,10 @@
 #SBATCH --job-name=test_eval_val
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:0
+#SBATCH --mem=32G
+#SBATCH --time=96:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --partition=ai_science
