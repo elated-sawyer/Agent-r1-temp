@@ -6,6 +6,7 @@ data:
   max_response_length: 512
   max_start_length: 256
   max_tool_response_length: 512
+  val_batch_size: 64
   return_raw_chat: False
   shuffle: True
   filter_overlong_prompts: False
@@ -38,6 +39,8 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  val_resume: True
+  val_shard_dir: ${trainer.default_local_dir}/global_step_0/val_shards
 
 tool:
   max_turns: 10
