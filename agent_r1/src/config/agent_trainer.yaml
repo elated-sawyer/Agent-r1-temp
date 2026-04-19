@@ -1,6 +1,7 @@
 data:
   tokenizer: null
   val_files: ~/data/rlhf/gsm8k/test.parquet
+  val_batch_size: 64
   prompt_key: prompt
   max_prompt_length: 512
   max_response_length: 512
@@ -38,6 +39,7 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  val_resume: True
 
 tool:
   max_turns: 10

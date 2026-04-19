@@ -34,6 +34,7 @@ from tqdm.auto import tqdm
 from filelock import FileLock
 import tempfile
 import pickle
+import shutil
 
 
 class ValidationPipeline(object):
@@ -70,18 +71,58 @@ class ValidationPipeline(object):
         )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
-            # Validation datasets are sent to inference engines as a whole batch,
-            # which will schedule the memory themselves.
-            batch_size=len(self.val_dataset),
+            batch_size=self.config.data.get('val_batch_size', 64),
             num_workers=8,
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn,
         )
 
-        assert len(
-            self.val_dataloader
-        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+    def _get_val_checkpoint_paths(self):
+        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
+                                                f'global_step_{self.global_steps}')
+        return {
+            'global_step_dir': local_global_step_folder,
+            'consolidated_env': os.path.join(local_global_step_folder, 'val_env_var.pkl'),
+            'shard_dir': os.path.join(local_global_step_folder, 'val_shard_dir'),
+        }
+
+    def _get_sample_shard_path(self, sample_idx):
+        return os.path.join(self._get_val_checkpoint_paths()['shard_dir'], f'sample_{sample_idx:08d}.pkl')
+
+    @staticmethod
+    def _slice_batch_dict(batch_dict, indices):
+        sliced = {}
+        for key, value in batch_dict.items():
+            if torch.is_tensor(value):
+                sliced[key] = value[indices]
+            else:
+                sliced[key] = [value[i] for i in indices]
+        return sliced
+
+    def _write_sample_shard(self, sample_idx, payload):
+        shard_path = self._get_sample_shard_path(sample_idx)
+        tmp_path = f"{shard_path}.tmp"
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(payload, f)
+        os.replace(tmp_path, shard_path)
+
+    def _load_sample_shard(self, sample_idx):
+        with open(self._get_sample_shard_path(sample_idx), 'rb') as f:
+            return pickle.load(f)
+
+    def _load_completed_indices(self):
+        shard_dir = self._get_val_checkpoint_paths()['shard_dir']
+        if not os.path.isdir(shard_dir):
+            return set()
+        completed = set()
+        for filename in os.listdir(shard_dir):
+            if filename.startswith('sample_') and filename.endswith('.pkl'):
+                try:
+                    completed.add(int(filename[len('sample_'):-len('.pkl')]))
+                except ValueError:
+                    continue
+        return completed
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -105,10 +146,9 @@ class ValidationPipeline(object):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _save_env_var(self, env_list):
-        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
-                                                f'global_step_{self.global_steps}')
-        local_latest_checkpointed_iteration = os.path.join(local_global_step_folder,
-                                                           'val_env_var.pkl')
+        paths = self._get_val_checkpoint_paths()
+        local_global_step_folder = paths['global_step_dir']
+        local_latest_checkpointed_iteration = paths['consolidated_env']
 
         # Using hash value of path as lock file name to avoid long file name
         lock_filename = f"env_{hash(local_global_step_folder) & 0xFFFFFFFF:08x}.lock"
@@ -126,9 +166,12 @@ class ValidationPipeline(object):
     def validate(self):
         import time
         val_start_time = time.time()
-        reward_tensor_lst = []
+        reward_lst = []
         turns_lst = []
         data_source_lst = []
+        end_score_lst = []
+        answer_score_lst = []
+        format_score_lst = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -161,12 +204,44 @@ class ValidationPipeline(object):
             is_validation=True,
         )
 
+        val_resume = self.config.trainer.get('val_resume', True)
+        checkpoint_paths = self._get_val_checkpoint_paths()
+        shard_dir = checkpoint_paths['shard_dir']
+        if not val_resume and os.path.isdir(shard_dir):
+            shutil.rmtree(shard_dir)
+        os.makedirs(shard_dir, exist_ok=True)
+        completed_indices = self._load_completed_indices()
+
         envs_var = []
-        total_samples_done = 0
+        total_samples_done = len(completed_indices)
         running_acc = []
         val_pbar = tqdm(self.val_dataloader, desc="Validation batches", leave=True)
         for batch_idx, test_data in enumerate(val_pbar):
-            test_batch = DataProto.from_single_dict(test_data)
+            original_batch_size = len(test_data['input_ids'])
+            batch_start = batch_idx * self.val_dataloader.batch_size
+            batch_indices = list(range(batch_start, batch_start + original_batch_size))
+            pending_indices = [idx for idx in batch_indices if idx not in completed_indices]
+
+            if not pending_indices:
+                for sample_idx in batch_indices:
+                    shard = self._load_sample_shard(sample_idx)
+                    envs_var.extend(shard['env_vars'])
+                    reward_lst.extend(shard['reward'])
+                    turns_lst.extend(shard['turns'])
+                    data_source_lst.extend(shard['data_source'])
+                    end_score_lst.extend(shard['end'])
+                    answer_score_lst.extend(shard['answer'])
+                    format_score_lst.extend(shard['format'])
+                    sample_inputs.extend(shard['input_texts'])
+                    sample_outputs.extend(shard['output_texts'])
+                    sample_scores.extend(shard['sample_scores'])
+                    running_acc.extend(shard['answer'])
+                val_pbar.set_postfix(total_done=total_samples_done, acc=f"{np.mean(running_acc):.4f}" if running_acc else "nan")
+                continue
+
+            pending_local_positions = [i for i, idx in enumerate(batch_indices) if idx in pending_indices]
+            pending_data = self._slice_batch_dict(test_data, pending_local_positions)
+            test_batch = DataProto.from_single_dict(pending_data)
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
@@ -233,7 +308,7 @@ class ValidationPipeline(object):
 
             # Store scores
             sample_scores.extend(answer_lst)
-            total_samples_done += batch_size
+            total_samples_done += len(pending_indices)
             running_acc.extend(answer_lst)
             val_pbar.set_postfix(
                 total_done=total_samples_done,
@@ -241,20 +316,45 @@ class ValidationPipeline(object):
                 last_gen=f"{gen_elapsed:.1f}s",
             )
 
-            reward_tensor_lst.append(reward_tensor)
-            turns_lst.append(test_batch.batch['turns'])
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            reward_values = reward_tensor.sum(-1).cpu().tolist()
+            turns_values = test_batch.batch['turns'].cpu().tolist()
+            data_source_values = list(test_batch.non_tensor_batch.get('data_source', ['unknown'] * len(reward_values)))
+            env_values = [env.get_tracking_variables() for env in envs]
 
-            envs_var += [env.get_tracking_variables() for env in envs]
+            reward_lst.extend(reward_values)
+            turns_lst.extend(turns_values)
+            data_source_lst.extend(data_source_values)
+            end_score_lst.extend(end_lst)
+            answer_score_lst.extend(answer_lst)
+            format_score_lst.extend(format_lst)
+            envs_var.extend(env_values)
+
+            repeat_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
+            for local_idx, sample_idx in enumerate(pending_indices):
+                start = local_idx * repeat_n
+                end = start + repeat_n
+                self._write_sample_shard(sample_idx, {
+                    'env_vars': env_values[start:end],
+                    'reward': reward_values[start:end],
+                    'turns': turns_values[start:end],
+                    'data_source': data_source_values[start:end],
+                    'end': end_lst[start:end],
+                    'answer': answer_lst[start:end],
+                    'format': format_lst[start:end],
+                    'input_texts': input_texts[start:end],
+                    'output_texts': output_texts[start:end],
+                    'sample_scores': answer_lst[start:end],
+                })
+                completed_indices.add(sample_idx)
 
         val_pbar.close()
 
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        turns_tensor = torch.cat(turns_lst, dim=0).cpu()
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        reward_tensor = torch.tensor(reward_lst, dtype=torch.float32)
+        turns_tensor = torch.tensor(turns_lst, dtype=torch.float32)
+        data_sources = np.array(data_source_lst, dtype=object)
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -269,13 +369,13 @@ class ValidationPipeline(object):
             data_source_reward[data_source].append(reward_tensor[i].item())
             if data_source not in data_source_end:
                 data_source_end[data_source] = []
-            data_source_end[data_source].append(end_lst[i])
+            data_source_end[data_source].append(end_score_lst[i])
             if data_source not in data_source_answer:
                 data_source_answer[data_source] = []
-            data_source_answer[data_source].append(answer_lst[i])
+            data_source_answer[data_source].append(answer_score_lst[i])
             if data_source not in data_source_format:
                 data_source_format[data_source] = []
-            data_source_format[data_source].append(format_lst[i])
+            data_source_format[data_source].append(format_score_lst[i])
             if data_source not in data_source_turns:
                 data_source_turns[data_source] = []
             data_source_turns[data_source].append(turns_tensor[i])
