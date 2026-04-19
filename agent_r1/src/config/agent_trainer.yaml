@@ -12,6 +12,10 @@ data:
   truncation: error
   image_key: images
   use_custom_tool_format_func: False
+  # Chunk size for crash-safe validation. Each chunk is checkpointed to
+  # val_shard_dir/ before the next chunk starts, so a mid-run failure
+  # loses at most one chunk's worth of samples.
+  val_batch_size: 64
 
 actor_rollout_ref:
   model:
@@ -38,6 +42,12 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  # When true, validate() reuses per-sample shards already on disk and only
+  # runs generation for the missing ones. Set to false to force a full rerun.
+  val_resume: true
+  # Optional override for the shard directory; defaults to
+  # {default_local_dir}/global_step_{global_steps}/val_shards/ when null.
+  val_shard_dir: null
 
 tool:
   max_turns: 10
