@@ -260,6 +260,218 @@ Make the validation-only pipeline in `ValidationPipeline.validate()` (`agent_r1/
 - Consequence: if the process dies anywhere inside `run_llm_loop` or `val_reward_fn`, **nothing is written to `val_env_var.pkl`** and all samples, API calls, and tool-search cost are lost.
 - There is currently no resume mechanism: re-launching `test.sbatch` re-runs every sample from scratch.
 
+## Suggested implementation outline
+
+> Reference: see `@workspace/verl/verl/trainer/ppo/ray_trainer.py:1130` for the canonical
+> `for batch_dict in self.train_dataloader:` pattern — iterate over a `DataLoader`, call
+> `DataProto.from_single_dict(batch_dict)`, `test_batch.pop(...)` to split into `gen_batch`,
+> run generation, then reward — and adapt exactly that structure here. The current
+> `validate()` already does all of this **once** over one giant batch; we only need to
+> turn that single iteration into N chunked iterations + persistence/resume.
+
+All changes below are confined to `ValidationPipeline` in
+`agent_r1/src/agent_ray_trainer_retro_noback.py` and its config, plus two new Hydra keys
+in `agent_r1/src/config/agent_trainer.yaml` / `test.sbatch`.
+
+### A. Config additions
+
+- `agent_r1/src/config/agent_trainer.yaml`:
+  - Under `data:` add `val_batch_size: 64` (the chunk size).
+  - Under `trainer:` add:
+    - `val_resume: True` (if `False`, clear the shard dir at startup).
+    - `val_shard_dir: null` (resolve to `${trainer.default_local_dir}/global_step_${...}/val_shards` when `null`).
+- `test.sbatch`: expose `data.val_batch_size=...` and `trainer.val_resume=...` as Hydra overrides (no value change required for the default).
+
+### B. `_create_dataloader` — switch to chunked batching
+
+Replace the single-batch `StatefulDataLoader` with a chunked one. Keep `shuffle=False`
+and `drop_last=False` so sample indices are stable across runs (critical for resume).
+
+```python
+val_batch_size = int(self.config.data.get('val_batch_size', 64))
+self.val_dataloader = StatefulDataLoader(
+    dataset=self.val_dataset,
+    batch_size=val_batch_size,
+    num_workers=8,
+    shuffle=False,
+    drop_last=False,
+    collate_fn=collate_fn,
+)
+# Drop the old `assert len(self.val_dataloader) == 1`.
+self.val_total_samples = len(self.val_dataset)
+self.val_num_chunks   = len(self.val_dataloader)
+```
+
+Each `batch_dict` yielded by the loader corresponds to a contiguous range of dataset
+indices `[chunk_idx * val_batch_size, (chunk_idx + 1) * val_batch_size)` (clipped at the
+end). Use `chunk_idx` (the `enumerate(...)` index) as the shard id.
+
+### C. Shard directory layout (on-disk state)
+
+Resolve once in `validate()` / `__init__`:
+
+```
+<shard_dir>/
+  chunk_00000.pkl   # pickled dict (see schema below)
+  chunk_00001.pkl
+  ...
+  DONE              # sentinel, written after consolidation succeeds
+```
+
+Each `chunk_XXXXX.pkl` stores everything needed to (a) rebuild final metrics without
+re-running the API and (b) reconstruct `val_env_var.pkl`. Minimal schema:
+
+```python
+{
+    "chunk_idx": int,
+    "sample_indices": list[int],          # absolute dataset indices covered
+    "envs_var":       list[dict],         # [env.get_tracking_variables() for env in envs]
+    "reward_tensor":  torch.Tensor,       # shape (B, max_response_length) - saved via torch.save-compatible bytes
+    "turns_tensor":   torch.Tensor,       # shape (B,)
+    "data_sources":   list[str],
+    "end_lst":        list,
+    "answer_lst":     list,
+    "format_lst":     list,
+    "sample_inputs":  list[str],          # decoded prompts
+    "sample_outputs": list[str],          # decoded responses
+    "sample_scores":  list,               # == answer_lst, kept explicit for logger
+}
+```
+
+Write atomically: dump to `chunk_XXXXX.pkl.tmp`, then `os.replace(tmp, final)`. Guard the
+dir creation with the same `FileLock` pattern already used by `_save_env_var`.
+
+### D. Resume logic (at the top of `validate()`)
+
+```python
+shard_dir = self._resolve_shard_dir()          # new helper
+if not self.config.trainer.get('val_resume', True):
+    shutil.rmtree(shard_dir, ignore_errors=True)
+os.makedirs(shard_dir, exist_ok=True)
+
+done_chunks = self._scan_done_chunks(shard_dir)  # -> set[int], loads each chunk_XXXXX.pkl lazily only when needed
+total_done_samples = sum(len(c["sample_indices"]) for c in done_chunks.values())
+```
+
+- If `DONE` exists and `val_resume` is `True`: load every chunk into memory, skip the
+  `for batch_dict` loop entirely, jump straight to step **F** (aggregation).
+- Otherwise, in the main loop, **skip any `chunk_idx` already present** in
+  `done_chunks` before doing any API work (but still feed the loader to advance it —
+  `StatefulDataLoader` iteration is cheap because generation is what costs money, not
+  tokenization).
+
+### E. Chunked main loop — minimal diff from today's `validate()`
+
+Structure (mirrors `ray_trainer.py:1130`):
+
+```python
+val_pbar = tqdm(
+    total=self.val_total_samples,
+    initial=total_done_samples,
+    desc="Validation samples",
+)
+for chunk_idx, test_data in enumerate(self.val_dataloader):
+    if chunk_idx in done_chunks:
+        continue                                            # resume skip
+
+    test_batch = DataProto.from_single_dict(test_data)
+    test_batch = test_batch.repeat(
+        repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+        interleave=True,
+    )
+    envs = [self.val_env.copy(test_batch.non_tensor_batch['target'][ii])
+            for ii in range(len(test_batch))]
+
+    # ... existing input_ids decode, test_gen_batch pop, meta_info setup ...
+    # ... existing generation_manager.run_llm_loop(...) call ...
+    # ... existing val_reward_fn(...) call ...
+
+    chunk_payload = {
+        "chunk_idx": chunk_idx,
+        "sample_indices": list(range(
+            chunk_idx * self.config.data.val_batch_size,
+            chunk_idx * self.config.data.val_batch_size + len(test_batch),
+        )),
+        "envs_var":       [env.get_tracking_variables() for env in envs],
+        "reward_tensor":  reward_tensor.cpu(),
+        "turns_tensor":   test_batch.batch['turns'].cpu(),
+        "data_sources":   list(test_batch.non_tensor_batch.get(
+            'data_source', ['unknown'] * reward_tensor.shape[0])),
+        "end_lst":        end_lst,
+        "answer_lst":     answer_lst,
+        "format_lst":     format_lst,
+        "sample_inputs":  input_texts,
+        "sample_outputs": output_texts,
+        "sample_scores":  answer_lst,
+    }
+    self._write_chunk(shard_dir, chunk_idx, chunk_payload)   # atomic write + FileLock
+    done_chunks[chunk_idx] = chunk_payload
+
+    total_done_samples += len(test_batch)
+    val_pbar.update(len(test_batch))
+    val_pbar.set_postfix(
+        chunk=f"{chunk_idx + 1}/{self.val_num_chunks}",
+        acc=f"{np.mean([s for c in done_chunks.values() for s in c['answer_lst']]):.4f}",
+    )
+
+val_pbar.close()
+```
+
+### F. Final aggregation (unchanged semantics)
+
+After the loop, stitch all chunks back into the same flat structures the current code
+uses, then run the **exact same** `data_source_*` / `metric_dict` code:
+
+```python
+chunks_sorted   = [done_chunks[i] for i in sorted(done_chunks)]
+reward_tensor   = torch.cat([c["reward_tensor"] for c in chunks_sorted], dim=0).sum(-1)
+turns_tensor    = torch.cat([c["turns_tensor"]  for c in chunks_sorted], dim=0)
+data_sources    = np.array([ds for c in chunks_sorted for ds in c["data_sources"]])
+end_lst         = [x for c in chunks_sorted for x in c["end_lst"]]
+answer_lst      = [x for c in chunks_sorted for x in c["answer_lst"]]
+format_lst      = [x for c in chunks_sorted for x in c["format_lst"]]
+envs_var        = [x for c in chunks_sorted for x in c["envs_var"]]
+sample_inputs   = [x for c in chunks_sorted for x in c["sample_inputs"]]
+sample_outputs  = [x for c in chunks_sorted for x in c["sample_outputs"]]
+sample_scores   = [x for c in chunks_sorted for x in c["sample_scores"]]
+```
+
+Then reuse the existing `for i in range(reward_tensor.shape[0]): ...` block verbatim to
+build `metric_dict`, and call `self._maybe_log_val_generations(...)` with the
+concatenated inputs/outputs/scores. The metrics and wandb table must be bit-identical to
+today's output for an uninterrupted run.
+
+### G. Consolidation for downstream compatibility
+
+After aggregation succeeds, write the single consolidated pickle exactly where
+`_save_env_var` writes today (keep that method; just let `run()` call it with the
+concatenated `envs_var`), then `touch <shard_dir>/DONE` inside the same `FileLock`.
+
+```python
+self._save_env_var(envs_var)
+open(os.path.join(shard_dir, "DONE"), "w").close()
+```
+
+This keeps every downstream consumer of `val_env_var.pkl` working unchanged.
+
+### H. Helper methods to add
+
+- `_resolve_shard_dir(self) -> str`
+- `_scan_done_chunks(self, shard_dir) -> dict[int, dict]` — load existing `chunk_*.pkl`
+  (ignore `*.tmp`), return keyed by `chunk_idx`.
+- `_write_chunk(self, shard_dir, chunk_idx, payload)` — pickle to `.tmp`, `os.replace`,
+  guarded by the existing `FileLock` pattern from `_save_env_var`.
+
+### I. What must **not** change
+
+- `ToolGenerationManager.run_llm_loop(...)` signature / internals.
+- `RewardManager` / `val_reward_fn` signature / return shape.
+- `ToolRLDataset` / `collate_fn`.
+- The final `metric_dict` keys and values for an uninterrupted run.
+- The on-disk path or schema of `val_env_var.pkl` (it's still the single consolidated
+  list of `env.get_tracking_variables()` dicts).
+
+
 ## Desired behavior
 
 1. **Chunked execution.** Split the validation set into chunks of configurable size (default `64`, overridable from `test.sbatch` / Hydra, e.g. `data.val_batch_size=64`). Process chunks sequentially; within a chunk keep the existing parallel API calls (the goal is checkpointing granularity, not reducing concurrency).
