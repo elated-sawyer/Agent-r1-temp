@@ -38,11 +38,11 @@ case "$DATASET" in
         ;;
 esac
 
-EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
-CHECKPOINT_DIR="./checkpoints/retro_qwen2.5-7b-instruct-1M_10_test/${EXPERIMENT_NAME}"
 
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 VAL_TAG="$(basename "$VAL_FILES" .parquet)"
+EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
+CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_job-${SLURM_JOB_ID}"
 LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_job-${SLURM_JOB_ID}.log"
 mkdir -p logs
 
