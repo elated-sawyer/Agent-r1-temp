@@ -67,16 +67,19 @@ else
     GPUS_PER_NODE=0
 fi
 
-export MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-0.8B}"   # only used for tokenizer loading
+export MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/wangzifu/cache/model/Qwen3.5-0.8B}"   # only used for tokenizer loading
 MODEL_TAG="${MODEL_PATH##*/}"
 
 export CPATH="/usr/include:${CPATH:-}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 # API model credentials
-export pjlab_APImodel_key="${!API_KEY_VAR:-}"
-export pjlab_APImodel_url="${!API_URL_VAR:-}"
-
+# export pjlab_APImodel_key="${!API_KEY_VAR:-}"
+# export pjlab_APImodel_url="${!API_URL_VAR:-}"
+# ------------------------------------------------------------------
+export pjlab_APImodel_key="EMPTY"
+export pjlab_APImodel_url="http://100.104.48.113:20010/v1"
+# ------------------------------------------------------------------
 
 echo "=== Run Config ==="
 echo "DATASET=$DATASET"
@@ -129,7 +132,7 @@ PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
     trainer.val_resume="$VAL_RESUME" \
-    trainer.logger="['console','wandb']" \
+    trainer.logger="['console']" \
     trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \

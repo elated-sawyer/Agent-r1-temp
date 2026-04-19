@@ -74,11 +74,17 @@ class ToolGenerationManager:
 
     def _build_api_client(self):
         if AsyncOpenAI is None:
-            return None
+            raise RuntimeError(
+                "openai package is required when tool.use_api_model=True but "
+                "AsyncOpenAI could not be imported. Install/upgrade `openai` in the env."
+            )
         api_key = os.environ.get("pjlab_APImodel_key")
         if not api_key:
-            return None
-        base_url = os.environ.get("pjlab_APImodel_url")
+            raise RuntimeError(
+                "pjlab_APImodel_key is empty. Export it (or set API_KEY_VAR to the "
+                "env var that holds your key) before running with tool.use_api_model=True."
+            )
+        base_url = os.environ.get("pjlab_APImodel_url") or None
         if base_url:
             return AsyncOpenAI(base_url=base_url, api_key=api_key)
         return AsyncOpenAI(api_key=api_key)
