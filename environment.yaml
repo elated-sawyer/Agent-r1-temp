@@ -84,7 +84,7 @@ dependencies:
       - annotated-types==0.7.0
       - antlr4-python3-runtime==4.9.3
       - anyio==4.9.0
-      - apex==0.1
+      # - apex==0.1
       - asciitree==0.3.3
       - astor==0.8.1
       - async-timeout==5.0.1
@@ -245,7 +245,7 @@ dependencies:
       - pulp==3.1.1
       - py-cpuinfo==9.0.0
       - py-spy==0.4.0
-      - pyairports==2.1.1
+      # - pyairports==2.1.1
       - pyarrow==19.0.1
       - pyasn1==0.6.1
       - pyasn1-modules==0.4.1
@@ -257,7 +257,7 @@ dependencies:
       - pylatexenc==2.10
       - pynvml==12.0.0
       - pyparsing==3.2.3
-      - pyprof==1.0.0
+      # - pyprof==1.0.0
       - pytest==8.3.5
       - pytest-asyncio==0.25.3
       - pytest-cov==6.0.0
@@ -265,7 +265,7 @@ dependencies:
       - pytest-random-order==1.1.1
       - python-dateutil==2.9.0.post0
       - python-dotenv==1.0.1
-      - python-graphviz==0.20.3
+      # - python-graphviz==0.20.3
       - python-json-logger==3.3.0
       - python-multipart==0.0.20
       - pytz==2025.2
@@ -309,14 +309,16 @@ dependencies:
       - tokenizers==0.21.1
       - tomli==2.2.1
       - torch==2.6.0
-      - torchaudio==2.6.0
-      - torchdata==0.11.0
+      # - torchaudio==2.6.0
+      # - torchdata==0.11.0
       - torchprofile==0.0.4
-      - torchvision==0.21.0
+      # - torchvision==0.21.0
       - tqdm==4.67.1
-      - transformer-engine==2.1.0
-      - transformer-engine-cu12==2.1.0
-      - transformer-engine-torch==2.1.0
+      # 等环境建好、torch 正常后，手动在环境里装，例如：
+      # pip install --no-build-isolation transformer-engine==2.1.0 transformer-engine-cu12==2.1.0 transformer-engine-torch==2.1.0
+      # - transformer-engine==2.1.0
+      # - transformer-engine-cu12==2.1.0
+      # - transformer-engine-torch==2.1.0
       - transformers==4.51.3
       - trec-car-tools==2.6
       - triton==3.2.0
@@ -329,7 +331,7 @@ dependencies:
       - uvicorn==0.34.0
       - uvloop==0.21.0
       - virtualenv==20.28.0
-      - vllm==0.8.5
+      # - vllm==0.8.5
       - wandb==0.19.8
       - warc3-wet==0.2.5
       - warc3-wet-clueweb09==0.2.5
@@ -337,7 +339,7 @@ dependencies:
       - websockets==15.0.1
       - werkzeug==3.1.3
       - wrapt==1.17.2
-      - xformers==0.0.29.post2
+      # - xformers==0.0.29.post2
       - xgrammar==0.1.18
       - xxhash==3.5.0
       - yarl==1.18.3
