@@ -24,7 +24,7 @@ API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
 API_KEY_VAR="${API_KEY_VAR:-pjlab_APImodel_key}"
 API_URL_VAR="${API_URL_VAR:-pjlab_APImodel_url}"
 # Set True when the API accepts no key (e.g. local OpenAI-compatible gateway).
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
 VAL_RESUME="${VAL_RESUME:-True}"
 
 case "$DATASET" in
@@ -138,7 +138,7 @@ PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
     trainer.n_gpus_per_node="$GPUS_PER_NODE" \
     trainer.nnodes="$NNODES" \
     tool.debug=True \
-    tool.api_max_concurrency=32 \
+    tool.api_max_concurrency=64 \
     tool.max_turns="$MAX_TURNS" \
     tool.topk=10 \
     tool.shuffle=False \

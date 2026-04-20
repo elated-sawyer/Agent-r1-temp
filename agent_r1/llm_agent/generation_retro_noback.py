@@ -433,15 +433,25 @@ class ToolGenerationManager:
             add_special_tokens=False,
             return_tensors='pt',
             padding='longest',
-        )['input_ids']
+        )['input_ids'].to(torch.long)
 
-        # Pad/truncate to max_response_length to match expected shape
+        # Pad/truncate to max_response_length to match expected shape.
+        # Note: when all response_texts are empty strings, the tokenizer returns a
+        # tensor of shape [batch_size, 0] whose dtype may default to float, which
+        # later breaks tokenizer.batch_decode (expects integer ids). We therefore
+        # explicitly force dtype=torch.long here and handle the empty-seq case.
         max_resp_len = self.config.max_response_length
-        if response_ids.shape[1] < max_resp_len:
+        if response_ids.shape[1] == 0:
+            response_ids = torch.full(
+                (batch_size, max_resp_len),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+            )
+        elif response_ids.shape[1] < max_resp_len:
             pad = torch.full(
                 (batch_size, max_resp_len - response_ids.shape[1]),
                 self.tokenizer.pad_token_id,
-                dtype=response_ids.dtype,
+                dtype=torch.long,
             )
             response_ids = torch.cat([response_ids, pad], dim=1)
         elif response_ids.shape[1] > max_resp_len:

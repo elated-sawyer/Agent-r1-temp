@@ -285,7 +285,10 @@ class ValidationPipeline(object):
                         min(chunk_idx * val_batch_size + chunk_sample_count, self.val_total_samples),
                     )),
                     'envs_var': [env.get_tracking_variables() for env in envs],
-                    'reward_tensor': reward_tensor.cpu(),
+                    # Reduce over the response-length dim here so chunks with
+                    # different dynamic response lengths can be concatenated
+                    # safely later. Shape: [B] instead of [B, L].
+                    'reward_tensor': reward_tensor.sum(-1).cpu(),
                     'turns_tensor': test_batch.batch['turns'].cpu(),
                     'data_sources': list(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])),
                     'end_lst': end_lst,
@@ -303,7 +306,16 @@ class ValidationPipeline(object):
         if len(chunks_sorted) == 0:
             raise RuntimeError("No validation chunks available for aggregation.")
 
-        reward_tensor = torch.cat([chunk['reward_tensor'] for chunk in chunks_sorted], dim=0).sum(-1)
+        # Normalize chunk reward tensors to 1D [B]. New chunks are already 1D;
+        # legacy cached chunks may still be 2D [B, L] with varying L, so reduce
+        # here for backward compatibility before concatenating along dim 0.
+        reward_tensor = torch.cat(
+            [
+                c['reward_tensor'] if c['reward_tensor'].dim() == 1 else c['reward_tensor'].sum(-1)
+                for c in chunks_sorted
+            ],
+            dim=0,
+        )
         turns_tensor = torch.cat([chunk['turns_tensor'] for chunk in chunks_sorted], dim=0)
         data_sources = np.array([source for chunk in chunks_sorted for source in chunk['data_sources']])
         end_lst = [item for chunk in chunks_sorted for item in chunk['end_lst']]
