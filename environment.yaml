@@ -316,9 +316,9 @@ dependencies:
       - tqdm==4.67.1
       # 等环境建好、torch 正常后，手动在环境里装，例如：
       # pip install --no-build-isolation transformer-engine==2.1.0 transformer-engine-cu12==2.1.0 transformer-engine-torch==2.1.0
-      # - transformer-engine==2.1.0
-      # - transformer-engine-cu12==2.1.0
-      # - transformer-engine-torch==2.1.0
+      - transformer-engine==2.1.0
+      - transformer-engine-cu12==2.1.0
+      - transformer-engine-torch==2.1.0
       - transformers==4.51.3
       - trec-car-tools==2.6
       - triton==3.2.0
@@ -331,7 +331,7 @@ dependencies:
       - uvicorn==0.34.0
       - uvloop==0.21.0
       - virtualenv==20.28.0
-      # - vllm==0.8.5
+      - vllm==0.8.5
       - wandb==0.19.8
       - warc3-wet==0.2.5
       - warc3-wet-clueweb09==0.2.5
@@ -339,7 +339,7 @@ dependencies:
       - websockets==15.0.1
       - werkzeug==3.1.3
       - wrapt==1.17.2
-      # - xformers==0.0.29.post2
+      - xformers==0.0.29.post2
       - xgrammar==0.1.18
       - xxhash==3.5.0
       - yarl==1.18.3
