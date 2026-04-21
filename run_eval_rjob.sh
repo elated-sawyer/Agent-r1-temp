@@ -92,8 +92,8 @@ TOOL_ENV="${TOOL_ENV:-retro_noback_V4}"
 # Conda env activation (optional)
 # Set CONDA_SH and CONDA_ENV via -e if your image ships miniforge/miniconda
 #======================================
-CONDA_SH="${CONDA_SH:-$HOME/miniforge3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-retro_r1}"
+CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-Retro_R1}"
 if [[ -f "$CONDA_SH" ]]; then
     # shellcheck disable=SC1090
     source "$CONDA_SH"
