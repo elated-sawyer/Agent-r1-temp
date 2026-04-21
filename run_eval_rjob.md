@@ -14,7 +14,7 @@ rjob submit \
   --image=registry.h.pjlab.org.cn/ailab/ml-base:22.04-pjlab \
   -e DISTRIBUTED_JOB=true \
   -e DATASET=retro \
-  -e MODEL_PATH=/mnt/shared-storage-user/ai4cmp/models/0401-preview \
+  -e MODEL_PATH=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B-Base/snapshots/e2ee613a3820d4482636d51b6d2eec45eb6d025b \
   -e API_MODEL_NAME='Qwen/Qwen3.5-35B-A3B' \
   -e MAX_TURNS=100 \
   -e TOPK=10 \

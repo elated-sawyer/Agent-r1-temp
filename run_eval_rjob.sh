@@ -150,6 +150,7 @@ env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.wrap_policy.disable=True \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path="$MODEL_PATH" \
