@@ -10,6 +10,7 @@ rjob submit \
   --private-machine=group \
   --mount=gpfs://gpfs1/wangzifu:/mnt/shared-storage-user/wangzifu \
   --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
+  --mount=gpfs://gpfs1/ai4cmp:/mnt/shared-storage-user/ai4cmp \
   --image=registry.h.pjlab.org.cn/ailab/ml-base:22.04-pjlab \
   -e DISTRIBUTED_JOB=true \
   -e DATASET=retro \

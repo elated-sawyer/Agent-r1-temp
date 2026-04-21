@@ -11,7 +11,6 @@ from agent_r1.tool.tool_base import Tool
 
 # from txtai.embeddings import Embeddings
 import faiss
-from FlagEmbedding import FlagAutoModel
 import json
 
 class SearchTool(Tool):
@@ -52,17 +51,41 @@ class SearchTool(Tool):
         
         # Load index and corpus using absolute paths
         self.index = faiss.read_index(os.path.join(data_dir, "index.bin"))
-        self.model = FlagAutoModel.from_finetuned(
-            'BAAI/bge-large-en-v1.5',
-            query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
-            devices="cpu",   # if not specified, will use all available gpus or cpu when no gpu available
-        )
+        self.model = None
         self.corpus = []
         with open(os.path.join(data_dir, "hpqa_corpus.jsonl"), "r") as f:
             for idx, line in enumerate(f):
                 data = json.loads(line)
                 self.corpus.append(data['title'] + " " + data["text"])
         print("[DEBUG] EMBEDDINGS LOADING END")
+
+    def _ensure_model_loaded(self) -> None:
+        """Lazily initialize embedding model to avoid import-time hard failures."""
+        if self.model is not None:
+            return
+
+        try:
+            from FlagEmbedding import FlagAutoModel
+        except Exception as exc:
+            raise RuntimeError(
+                "SearchTool requires FlagEmbedding, but importing it failed. "
+                "This is often caused by an incompatible transformers/FlagEmbedding "
+                "combination. Please install compatible versions, then retry. "
+                f"Original error: {exc}"
+            ) from exc
+
+        try:
+            self.model = FlagAutoModel.from_finetuned(
+                'BAAI/bge-large-en-v1.5',
+                query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
+                devices="cpu",   # if not specified, will use all available gpus or cpu when no gpu available
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "SearchTool failed to initialize FlagEmbedding model "
+                "'BAAI/bge-large-en-v1.5'. Please verify model access and dependency "
+                f"compatibility. Original error: {exc}"
+            ) from exc
 
     
     def execute(self, args: Dict) -> str:
@@ -80,6 +103,7 @@ class SearchTool(Tool):
         pass
     
     def batch_execute(self, args_list: List[Dict]) -> List[str]:
+        self._ensure_model_loaded()
         queries = [x["query"] for x in args_list]
         embeddings = self.model.encode_queries(queries)
         dist, ids = self.index.search(embeddings, 5) # ids: b*5

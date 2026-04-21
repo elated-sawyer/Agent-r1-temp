@@ -343,5 +343,6 @@ dependencies:
       - yarl==1.18.3
       - zarr==2.18.3
       - zipp==3.21.0
+      - flash-attn==2.7.4.post1
       - zlib-state==0.1.9
 prefix: /root/miniconda3/envs/Retro_R1

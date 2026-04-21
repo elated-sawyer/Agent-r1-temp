@@ -78,6 +78,7 @@ echo "NNODES=$NNODES"
 echo "GPUS_PER_NODE=$GPUS_PER_NODE"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
 nvidia-smi || true
+test -d "$MODEL_PATH" && ls "$MODEL_PATH/tokenizer_config.json" || { echo "MODEL_PATH missing: $MODEL_PATH"; exit 1; }
 
 #======================================
 # Tunable hyperparameters (overridable via rjob -e)
@@ -159,7 +160,7 @@ env -u ROCR_VISIBLE_DEVICES -u HIP_VISIBLE_DEVICES \
     critic.model.fsdp_config.fsdp_size=8 \
     critic.ppo_max_token_len_per_gpu=65536 \
     algorithm.use_process_rewards=False \
-    algorithm.adv_estimator=gae \
+    algorithm.adv_estimator=grpo \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
     trainer.critic_warmup=3 \
