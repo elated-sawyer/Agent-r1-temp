@@ -19,9 +19,11 @@ All Ray cluster dependencies and training logic have been removed.
 import os
 from pprint import pprint
 import glob
+import json
 import shutil
 
 import numpy as np
+import pandas as pd
 import torch
 from omegaconf import OmegaConf
 from verl import DataProto
@@ -56,6 +58,10 @@ class ValidationPipeline(object):
         self._create_dataloader()
 
     def _create_dataloader(self):
+        # SFT data collection requires the raw per-sample chat messages so we
+        # can reconstruct clean (system, user, assistant, tool, ...) traces
+        # without having to re-split the templated tokenized prompt. Force
+        # this on regardless of what the user set in config/data.
         self.val_dataset = ToolRLDataset(
             parquet_files=self.config.data.val_files,
             tokenizer=self.tokenizer,
@@ -64,7 +70,7 @@ class ValidationPipeline(object):
             image_key=self.config.data.get('image_key', 'images'),
             max_prompt_length=self.config.data.max_start_length,
             filter_prompts=True,
-            return_raw_chat=self.config.data.get('return_raw_chat', False),
+            return_raw_chat=True,
             truncation='error',
             filter_overlong_prompts=self.config.data.filter_overlong_prompts,
             tool_env=self.val_env,
@@ -156,6 +162,202 @@ class ValidationPipeline(object):
                 pickle.dump(payload, f)
             os.replace(tmp_path, final_path)
 
+    # ------------------------------------------------------------------
+    # SFT self-distillation helpers
+    # ------------------------------------------------------------------
+    @property
+    def _dataset_tag(self) -> str:
+        """Stable short identifier for the input dataset, used in the SFT
+        parquet filename. Falls back to 'dataset' if val_files is empty."""
+        val_files = self.config.data.val_files
+        if isinstance(val_files, (list, tuple)):
+            first = val_files[0] if val_files else 'dataset'
+        else:
+            first = val_files or 'dataset'
+        return os.path.splitext(os.path.basename(str(first)))[0] or 'dataset'
+
+    @property
+    def _model_tag(self) -> str:
+        model_path = str(self.config.actor_rollout_ref.model.path or 'model')
+        return os.path.basename(model_path.rstrip('/')) or 'model'
+
+    def _sft_output_dir(self) -> str:
+        """Directory where consolidated SFT parquet snapshots are written.
+
+        Kept at repo-relative ``data_sft/`` per the spec: a single sink for
+        all SFT collection runs; disambiguation lives in the filename.
+        """
+        out_dir = 'data_sft'
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    def _sft_snapshot_filename(self, step_tag: str) -> str:
+        n = int(self.config.actor_rollout_ref.rollout.val_kwargs.get('n', 1))
+        temp = float(self.config.actor_rollout_ref.rollout.val_kwargs.get('temperature', 0.0))
+        force_noloop = bool(self.config.tool.get('force_noloop', False))
+        return (
+            f"sft__{self._dataset_tag}__model-{self._model_tag}__"
+            f"noloop-{force_noloop}__n{n}__T{temp:.2f}__step{step_tag}.parquet"
+        )
+
+    def _raw_chat_to_system_user(self, raw_chat):
+        """Extract (system_content, user_content) from a per-sample chat list.
+
+        ``raw_chat`` is whatever ``ToolRLDataset`` stashed under the
+        ``raw_prompt`` non-tensor key, which reflects whatever modifications
+        (e.g. ``use_custom_tool_format_func``) the dataset applied before
+        chat-template rendering — so re-applying the same chat template at
+        SFT training time will reproduce the exact prompt the policy saw at
+        rollout time, regardless of that flag's value.
+        """
+        if raw_chat is None:
+            return "", ""
+        if hasattr(raw_chat, 'tolist'):
+            chat_list = raw_chat.tolist()
+        else:
+            chat_list = list(raw_chat)
+        system_content = ""
+        user_content = ""
+        for msg in chat_list:
+            role = msg.get('role') if isinstance(msg, dict) else None
+            content = msg.get('content') if isinstance(msg, dict) else None
+            if role == 'system' and not system_content:
+                system_content = content or ""
+            elif role == 'user' and not user_content:
+                user_content = content or ""
+        return system_content, user_content
+
+    def _build_sft_records(self, sample_indices, envs, raw_prompts,
+                           answer_lst, turns_list, response_lengths,
+                           data_sources):
+        """Assemble the per-chunk SFT record list.
+
+        For each original query in the (pre-repeat) chunk, group its ``n``
+        rollouts, keep the successful ones, sort by (turns asc, generated
+        token length asc), and emit the top 2. Each record is a single SFT
+        training example in the final chat schema.
+        """
+        n = int(self.config.actor_rollout_ref.rollout.val_kwargs.get('n', 1))
+        records = []
+        force_noloop = bool(self.config.tool.get('force_noloop', False))
+        rollout_temp = float(self.config.actor_rollout_ref.rollout.val_kwargs.get('temperature', 0.0))
+        model_path = str(self.config.actor_rollout_ref.model.path or '')
+        api_model = str(self.config.tool.get('api_model_name', ''))
+
+        for q, abs_query_idx in enumerate(sample_indices):
+            # Collect successful rollouts for this query.
+            rollouts = []
+            for k in range(n):
+                i = q * n + k
+                if i >= len(answer_lst):
+                    break
+                success = float(answer_lst[i]) > 0.0
+                if not success:
+                    continue
+                rollouts.append({
+                    'i': i,
+                    'turns': int(turns_list[i]),
+                    'gen_len': int(response_lengths[i]),
+                })
+            if not rollouts:
+                continue
+            # Shortest-by-turns, tie-break by generated-token-length.
+            rollouts.sort(key=lambda r: (r['turns'], r['gen_len']))
+            selected = rollouts[:2]
+
+            # All n rollouts share the same prompt thanks to
+            # test_batch.repeat(..., interleave=True); use the first as canon.
+            base_i = q * n
+            raw_chat = None
+            if raw_prompts is not None and base_i < len(raw_prompts):
+                raw_chat = raw_prompts[base_i]
+            system_content, user_content = self._raw_chat_to_system_user(raw_chat)
+
+            for rank, r in enumerate(selected):
+                env = envs[r['i']]
+                conversations = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ]
+                conversations.extend(env.get_conversation_messages())
+                data_source = "unknown"
+                if data_sources is not None and r['i'] < len(data_sources):
+                    data_source = str(data_sources[r['i']])
+
+                meta = {
+                    "abs_query_idx": int(abs_query_idx),
+                    "rollout_rank": int(rank),
+                    "n_turns": int(r['turns']),
+                    "success": True,
+                    "data_source": data_source,
+                    "force_noloop": force_noloop,
+                    "rollout_n": n,
+                    "rollout_temp": rollout_temp,
+                    "model_path": model_path,
+                    "api_model": api_model,
+                }
+                rec_id = (
+                    f"{self._dataset_tag}__q{int(abs_query_idx):06d}"
+                    f"__r{rank}__turns{int(r['turns'])}"
+                )
+                records.append({
+                    "id": rec_id,
+                    "conversations": conversations,
+                    "meta": meta,
+                })
+        return records
+
+    def _consolidate_sft(self, shard_dir: str, final: bool = False) -> str:
+        """Read all chunk pickles in ``shard_dir``, concatenate their
+        ``sft_records`` lists, and atomically write a single parquet
+        snapshot into ``data_sft/``.
+
+        Returns the written parquet path. The filename step tag is
+        ``FINAL`` when ``final=True`` and the zero-padded count of
+        completed chunk pickles otherwise — which, on resume, reflects
+        real progress rather than per-run progress.
+        """
+        chunk_files = sorted(glob.glob(os.path.join(shard_dir, 'chunk_*.pkl')))
+        chunks_done = len(chunk_files)
+
+        all_records = []
+        for cf in chunk_files:
+            try:
+                with open(cf, 'rb') as f:
+                    payload = pickle.load(f)
+            except Exception as exc:
+                print(f'[SFT] Skipping unreadable chunk pickle {cf}: {exc}')
+                continue
+            all_records.extend(payload.get('sft_records', []) or [])
+
+        rows = []
+        for rec in all_records:
+            rows.append({
+                'id': rec['id'],
+                # JSON-serialize both structured fields so the parquet schema
+                # stays stable as meta evolves and so downstream SFT trainers
+                # don't have to deal with variable-shape list[struct] columns.
+                'conversations': json.dumps(rec['conversations'], ensure_ascii=False),
+                'meta': json.dumps(rec['meta'], ensure_ascii=False),
+            })
+        df = pd.DataFrame(rows, columns=['id', 'conversations', 'meta'])
+
+        out_dir = self._sft_output_dir()
+        step_tag = 'FINAL' if final else f'{chunks_done:05d}'
+        final_path = os.path.join(out_dir, self._sft_snapshot_filename(step_tag))
+        tmp_path = f'{final_path}.tmp'
+
+        lock_filename = f"val_shard_{hash(shard_dir) & 0xFFFFFFFF:08x}.lock"
+        lock_path = os.path.join(tempfile.gettempdir(), lock_filename)
+        with FileLock(lock_path, timeout=60):
+            df.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, final_path)
+        print(
+            f'[SFT] Wrote {len(rows)} records from {chunks_done} chunks '
+            f'to {final_path}'
+        )
+        return final_path
+
     def validate(self):
         import time
         val_start_time = time.time()
@@ -167,6 +369,7 @@ class ValidationPipeline(object):
         done_chunks = self._scan_done_chunks(shard_dir)
 
         # Agent config preparation
+        val_kwargs = self.config.actor_rollout_ref.rollout.val_kwargs
         gen_config = ToolGenerationConfig(
             max_turns=self.config.tool.max_turns,
             max_start_length=self.config.data.max_start_length,
@@ -183,6 +386,9 @@ class ValidationPipeline(object):
             use_api_model=self.config.tool.get('use_api_model', False),
             api_model_name=self.config.tool.get('api_model_name', ''),
             api_max_concurrency=self.config.tool.get('api_max_concurrency', 32),
+            do_sample=bool(val_kwargs.get('do_sample', False)),
+            temperature=float(val_kwargs.get('temperature', 0.0)),
+            top_p=float(val_kwargs.get('top_p', 1.0)),
             debug=self.config.tool.get('debug', False),
         )
 
@@ -198,6 +404,8 @@ class ValidationPipeline(object):
             val_batch_size = int(self.config.data.get('val_batch_size', 64))
             total_done_samples = sum(len(chunk['sample_indices']) for chunk in done_chunks.values())
             all_done_answers = [score for chunk in done_chunks.values() for score in chunk['answer_lst']]
+            sft_save_every = int(self.config.trainer.get('sft_save_every', 50))
+            newly_done_chunks = 0
             val_pbar = tqdm(
                 total=self.val_total_samples,
                 initial=total_done_samples,
@@ -278,28 +486,58 @@ class ValidationPipeline(object):
                     last_gen=f"{gen_elapsed:.1f}s",
                 )
 
+                sample_indices = list(range(
+                    chunk_idx * val_batch_size,
+                    min(chunk_idx * val_batch_size + chunk_sample_count, self.val_total_samples),
+                ))
+                data_sources_list = list(
+                    test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])
+                )
+                turns_tensor_cpu = test_batch.batch['turns'].cpu()
+                # Non-pad generated-token count per rollout — used as the
+                # tie-breaker when two successful rollouts share turn count.
+                pad_id = self.tokenizer.pad_token_id
+                response_lengths = [
+                    int((row != pad_id).sum().item()) for row in output_ids
+                ]
+                raw_prompts = test_batch.non_tensor_batch.get('raw_prompt', None)
+                sft_records = self._build_sft_records(
+                    sample_indices=sample_indices,
+                    envs=envs,
+                    raw_prompts=raw_prompts,
+                    answer_lst=answer_lst,
+                    turns_list=[int(x) for x in turns_tensor_cpu.tolist()],
+                    response_lengths=response_lengths,
+                    data_sources=data_sources_list,
+                )
+
                 chunk_payload = {
                     'chunk_idx': chunk_idx,
-                    'sample_indices': list(range(
-                        chunk_idx * val_batch_size,
-                        min(chunk_idx * val_batch_size + chunk_sample_count, self.val_total_samples),
-                    )),
+                    'sample_indices': sample_indices,
                     'envs_var': [env.get_tracking_variables() for env in envs],
                     # Reduce over the response-length dim here so chunks with
                     # different dynamic response lengths can be concatenated
                     # safely later. Shape: [B] instead of [B, L].
                     'reward_tensor': reward_tensor.sum(-1).cpu(),
-                    'turns_tensor': test_batch.batch['turns'].cpu(),
-                    'data_sources': list(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])),
+                    'turns_tensor': turns_tensor_cpu,
+                    'data_sources': data_sources_list,
                     'end_lst': end_lst,
                     'answer_lst': answer_lst,
                     'format_lst': format_lst,
                     'sample_inputs': input_texts,
                     'sample_outputs': output_texts,
                     'sample_scores': answer_lst,
+                    'sft_records': sft_records,
                 }
                 self._write_chunk(shard_dir, chunk_idx, chunk_payload)
                 done_chunks[chunk_idx] = chunk_payload
+
+                newly_done_chunks += 1
+                if sft_save_every > 0 and newly_done_chunks % sft_save_every == 0:
+                    try:
+                        self._consolidate_sft(shard_dir, final=False)
+                    except Exception as exc:
+                        print(f'[SFT] Periodic consolidation failed (non-fatal): {exc}')
             val_pbar.close()
 
         chunks_sorted = [done_chunks[i] for i in sorted(done_chunks)]
@@ -370,6 +608,14 @@ class ValidationPipeline(object):
         with FileLock(os.path.join(tempfile.gettempdir(), f"val_shard_{hash(shard_dir) & 0xFFFFFFFF:08x}.lock"), timeout=60):
             with open(done_flag_path, 'w'):
                 pass
+        # Always emit the final consolidated SFT parquet, regardless of
+        # whether periodic snapshots fired: this is the authoritative output
+        # of the collection run.
+        try:
+            self._consolidate_sft(shard_dir, final=True)
+        except Exception as exc:
+            print(f'[SFT] Final consolidation failed: {exc}')
+            raise
         print(f'[Validation] Completed in {time.time() - val_start_time:.1f}s — {total_samples} samples')
         return metric_dict, envs_var
 

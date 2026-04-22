@@ -17,7 +17,7 @@ export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 # bash run_eval_rjob.sh
 # ======================================
 
-DATASET="${DATASET:-retro}"
+DATASET="${DATASET:-train_h4_10}"
 MAX_TURNS="${MAX_TURNS:-100}"
 FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
 API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
@@ -27,15 +27,18 @@ API_URL_VAR="${API_URL_VAR:-pjlab_APImodel_url}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 VAL_RESUME="${VAL_RESUME:-True}"
 
+# SFT self-distillation collection knobs (this branch is dedicated to SFT collection)
+ROLLOUT_N="${ROLLOUT_N:-8}"
+ROLLOUT_TEMP="${ROLLOUT_TEMP:-0.7}"
+ROLLOUT_TOPP="${ROLLOUT_TOPP:-1.0}"
+SFT_SAVE_EVERY="${SFT_SAVE_EVERY:-50}"
+
 case "$DATASET" in
-    chembl)
-        VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet"
-        ;;
-    retro)
-        VAL_FILES="./data/reaction_pathway_search/validation_retro_190.parquet"
+    train_h4_10)
+        VAL_FILES="./data/reaction_pathway_search/train_h4_10.parquet"
         ;;
     *)
-        echo "ERROR: unknown DATASET='$DATASET' (expected 'chembl' or 'retro')" >&2
+        echo "ERROR: unknown DATASET='$DATASET' (only 'train_h4_10' is supported on the sft_data_collection branch)" >&2
         exit 1
         ;;
 esac
@@ -93,6 +96,10 @@ echo "MAX_TURNS=$MAX_TURNS"
 echo "FORCE_NOLOOP=$FORCE_NOLOOP"
 echo "VAL_BATCH_SIZE=$VAL_BATCH_SIZE"
 echo "VAL_RESUME=$VAL_RESUME"
+echo "ROLLOUT_N=$ROLLOUT_N"
+echo "ROLLOUT_TEMP=$ROLLOUT_TEMP"
+echo "ROLLOUT_TOPP=$ROLLOUT_TOPP"
+echo "SFT_SAVE_EVERY=$SFT_SAVE_EVERY"
 echo "LOG_FILE=$LOG_FILE"
 
 echo "=== Runtime Info ==="
@@ -126,12 +133,15 @@ PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
     data.max_start_length=1024 \
     data.max_tool_response_length=4096 \
     data.val_batch_size="$VAL_BATCH_SIZE" \
+    data.return_raw_chat=True \
     actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature="$ROLLOUT_TEMP" \
+    actor_rollout_ref.rollout.val_kwargs.top_p="$ROLLOUT_TOPP" \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n="$ROLLOUT_N" \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
     trainer.val_resume="$VAL_RESUME" \
+    trainer.sft_save_every="$SFT_SAVE_EVERY" \
     trainer.logger="['console']" \
     trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
     trainer.experiment_name="$EXPERIMENT_NAME" \

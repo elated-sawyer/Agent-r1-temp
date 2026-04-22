@@ -33,7 +33,7 @@ class ToolGenerationConfig:
     """Configuration for tool-based generation"""
     max_turns: int
     max_start_length: int
-    max_prompt_length: int 
+    max_prompt_length: int
     max_response_length: int
     max_tool_response_length: int  # Renamed from max_obs_length
     num_gpus: int
@@ -47,6 +47,13 @@ class ToolGenerationConfig:
     use_api_model: bool = False
     api_model_name: str = ""
     api_max_concurrency: int = 32
+    # Sampling knobs forwarded to the OpenAI-compatible API. For SFT
+    # self-distillation we want actual sampling diversity across the `n`
+    # rollouts per query, so these must be non-zero / do_sample=True in the
+    # pipeline config. Defaults preserve the previous greedy behaviour.
+    do_sample: bool = False
+    temperature: float = 0.0
+    top_p: float = 1.0
     debug: bool = False
 
 class ToolGenerationManager:
@@ -365,6 +372,8 @@ class ToolGenerationManager:
 
         async def _call_api(prompt: str) -> str:
             """Call external API with concurrency limit and exponential backoff."""
+            api_temperature = self.config.temperature if self.config.do_sample else 0.0
+            api_top_p = self.config.top_p if self.config.do_sample else 1.0
             async with sem:
                 last_exc = None
                 for attempt in range(_MAX_RETRIES):
@@ -373,8 +382,8 @@ class ToolGenerationManager:
                             model=self.config.api_model_name,
                             messages=[{"role": "user", "content": prompt}],
                             max_tokens=self.config.max_response_length,
-                            temperature=0.0,
-                            top_p=1.0,
+                            temperature=api_temperature,
+                            top_p=api_top_p,
                             n=1,
                         )
                         return response.choices[0].message.content or ""
