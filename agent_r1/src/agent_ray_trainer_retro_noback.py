@@ -232,10 +232,10 @@ class ValidationPipeline(object):
                            data_sources):
         """Assemble the per-chunk SFT record list.
 
-        For each original query in the (pre-repeat) chunk, group its ``n``
-        rollouts, keep the successful ones, sort by (turns asc, generated
-        token length asc), and emit the top 2. Each record is a single SFT
-        training example in the final chat schema.
+        For each original query in the (pre-repeat) chunk, emit one SFT
+        record per successful rollout (no length-based filtering, no cap).
+        Each record is a single SFT training example in the final chat
+        schema. Queries with zero successful rollouts contribute nothing.
         """
         n = int(self.config.actor_rollout_ref.rollout.val_kwargs.get('n', 1))
         records = []
@@ -245,7 +245,9 @@ class ValidationPipeline(object):
         api_model = str(self.config.tool.get('api_model_name', ''))
 
         for q, abs_query_idx in enumerate(sample_indices):
-            # Collect successful rollouts for this query.
+            # Collect successful rollouts for this query, keyed by the
+            # original rollout slot k in [0, n). With interleave=True the
+            # expanded-batch index is i = q * n + k.
             rollouts = []
             for k in range(n):
                 i = q * n + k
@@ -256,14 +258,11 @@ class ValidationPipeline(object):
                     continue
                 rollouts.append({
                     'i': i,
+                    'k': k,
                     'turns': int(turns_list[i]),
-                    'gen_len': int(response_lengths[i]),
                 })
             if not rollouts:
                 continue
-            # Shortest-by-turns, tie-break by generated-token-length.
-            rollouts.sort(key=lambda r: (r['turns'], r['gen_len']))
-            selected = rollouts[:2]
 
             # All n rollouts share the same prompt thanks to
             # test_batch.repeat(..., interleave=True); use the first as canon.
@@ -273,7 +272,7 @@ class ValidationPipeline(object):
                 raw_chat = raw_prompts[base_i]
             system_content, user_content = self._raw_chat_to_system_user(raw_chat)
 
-            for rank, r in enumerate(selected):
+            for r in rollouts:
                 env = envs[r['i']]
                 conversations = [
                     {"role": "system", "content": system_content},
@@ -286,7 +285,8 @@ class ValidationPipeline(object):
 
                 meta = {
                     "abs_query_idx": int(abs_query_idx),
-                    "rollout_rank": int(rank),
+                    # original rollout index within the query group (0..n-1)
+                    "rollout_rank": int(r['k']),
                     "n_turns": int(r['turns']),
                     "success": True,
                     "data_source": data_source,
@@ -298,7 +298,7 @@ class ValidationPipeline(object):
                 }
                 rec_id = (
                     f"{self._dataset_tag}__q{int(abs_query_idx):06d}"
-                    f"__r{rank}__turns{int(r['turns'])}"
+                    f"__r{int(r['k'])}__turns{int(r['turns'])}"
                 )
                 records.append({
                     "id": rec_id,
@@ -494,8 +494,9 @@ class ValidationPipeline(object):
                     test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])
                 )
                 turns_tensor_cpu = test_batch.batch['turns'].cpu()
-                # Non-pad generated-token count per rollout — used as the
-                # tie-breaker when two successful rollouts share turn count.
+                # Non-pad generated-token count per rollout; kept plumbed through
+                # to _build_sft_records for downstream extensibility even though
+                # the current selection rule (all successes) doesn't need it.
                 pad_id = self.tokenizer.pad_token_id
                 response_lengths = [
                     int((row != pad_id).sum().item()) for row in output_ids

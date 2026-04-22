@@ -677,3 +677,71 @@ consolidated parquet named `…__stepFINAL.parquet` in `data_sft/`. Leave the in
   (same `id` set, same `conversations` content).
 
 
+
+
+2026-04-22
+
+## Amendment: drop top-2 shortest selection, keep every successful trajectory
+
+This amends the SFT-collection plan above (specifically §3 "Success filtering + top-2
+shortest per query" and the per-query row cap in the Acceptance criteria). Everything
+else in that plan — resume semantics, chunk-pickle wiring, periodic consolidation into
+`data_sft/`, parquet schema, config key names — stays as specified. Only the per-query
+selection rule changes.
+
+### Motivation
+
+The top-2 shortest filter was discarding valid SFT signal. With `ROLLOUT_N=8..16`, a
+query can easily produce 3–6 successful trajectories that differ in reasoning/tool-use
+paths but are all correct. We want all of them as SFT targets; shortness is no longer a
+selection criterion.
+
+### What to change
+
+1. **§3 selection rule.** Remove the "sort by turns ascending, tie-break by token length,
+   keep top-2" step. Replace with: for each query in the chunk, emit **one SFT record per
+   successful rollout** — no cap, no sort, no tie-break. Queries with zero successful
+   rollouts still contribute nothing. Success predicate is unchanged (`answer_lst[i]`
+   positive, per the existing reward path).
+
+2. **§4 record schema.**
+   - Redefine `meta.rollout_rank` as the **original rollout index within the query group**
+     (i.e. `i % n` in the expanded chunk, where `interleave=True` puts query `q`'s rollouts
+     at positions `[q*n, …, q*n + n-1]`). It is no longer "0 = shortest". Keep the field
+     name `rollout_rank` so downstream readers don't break; update the inline comment in
+     the schema from `# 0 = shortest, 1 = second shortest` to
+     `# original rollout index within the query group (0..n-1)`.
+   - The `id` template `…__q{abs_query_idx:06d}__r{rollout_rank}__turns{n_turns}` stays,
+     but `r{rollout_rank}` now ranges over 0..n-1 instead of 0..1. Two records from the
+     same query therefore have distinct `r…` values because they come from different
+     original rollout slots — ids stay unique.
+
+3. **Acceptance criteria.** Replace the bullet
+   > Per query, at most 2 rows; each row corresponds to a **successful** rollout; the two
+   > rows for the same query are the shortest-by-turns ones.
+
+   with
+   > Per query, 0..n rows, one per **successful** rollout in that query's group. No
+   > length-based filtering. Row count for a query equals the number of successful
+   > rollouts among its `n` rollouts; queries with zero successes contribute nothing.
+
+### What NOT to change
+
+- Do not remove the `turns` / `output_ids` length tracking — `n_turns` still goes into
+  `meta` and is useful for downstream analysis and for the `id` suffix.
+- Do not change the parquet schema, column names, file naming, or `sft_save_every`
+  behavior.
+- Do not change the resume contract: rerunning with the same `CHECKPOINT_DIR` must still
+  produce the same `id` set and same `conversations` content as an uninterrupted run.
+- Do not touch the config key layout; `ROLLOUT_N` / `ROLLOUT_TEMP` / `FORCE_NOLOOP` keep
+  their meaning.
+
+### Quick sanity check after the change
+
+Run `DATASET=train_h4_10 ROLLOUT_N=8 FORCE_NOLOOP=True bash run_eval_rjob.sh` on a small
+slice and confirm:
+- At least one query in the output has `> 2` rows (previously impossible).
+- Every emitted row still has `meta.success == True`.
+- `meta.rollout_rank` values within a single `abs_query_idx` are a subset of `{0..n-1}`
+  with no duplicates.
+- Total row count ≈ sum of per-query successful rollouts, not `min(2, …)` per query.
