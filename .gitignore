@@ -136,3 +136,4 @@ one_step_model/
 
 
 *.pkl
+*.jsonl
