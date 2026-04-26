@@ -70,7 +70,7 @@ else
     GPUS_PER_NODE=0
 fi
 
-export MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/wangzifu/cache/model/Qwen3.5-0.8B}"   # only used for tokenizer loading
+export MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-gpfs2/wangzifugpfs2/cache/model/Qwen3.5-0.8B}"   # only used for tokenizer loading
 MODEL_TAG="${MODEL_PATH##*/}"
 
 export CPATH="/usr/include:${CPATH:-}"
@@ -115,7 +115,7 @@ command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 # ======================================
 # Activate env
 # ======================================
-CONDA_BASE="${CONDA_BASE:-/mnt/shared-storage-user/wangzifu/miniconda3}"
+CONDA_BASE="${CONDA_BASE:-/mnt/shared-storage-gpfs2/wangzifugpfs2/miniconda3}"
 if [[ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
     echo "ERROR: conda.sh not found under CONDA_BASE='$CONDA_BASE'." >&2
     exit 1
