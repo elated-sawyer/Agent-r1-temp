@@ -133,3 +133,11 @@ dataset/
 experience_data/
 train_results/
 one_step_model/
+data/retro_tool_sft.jsonl
+data/chunk_sft.pkl
+data/chunk_sft_tagged_dedup.pkl
+data/retro_tool_sft.jsonl
+data/chunk_sft.pkl
+data/chunk_sft_tagged_dedup.pkl
+*.pkl
+data/*.jsonl
