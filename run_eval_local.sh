@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# Run the validation pipeline directly on this compute node (no rjob).
+#
+# Pipeline:
+#   1. Merge the LoRA adapter into the base model with `llamafactory-cli export`
+#      (one-time; cached under MERGED_DIR). Skipped if MERGED_DIR already exists.
+#   2. Start vLLM (`vllm serve`) in the background, serving the merged model on
+#      LOCAL_API_PORT. Wait until /v1/models is responsive.
+#   3. Run agent_r1.src.main_agent_retro_noback against the local endpoint.
+#   4. On exit, stop the vLLM server (TERM, then KILL after a grace window).
+#
+# The merge step uses the LlamaFactory conda env (knows the custom Qwen3_5
+# architecture). Serving and eval use the Retro_R1 env (has vllm + agent_r1).
+#
+# Override anything via env vars. Common ones:
+#   ADAPTER_DIR        path to the LoRA adapter directory
+#   MERGED_DIR         where to save the merged model (cached)
+#   BASE_MODEL_PATH    base model used during SFT
+#   DATASET            chembl | retro            (default: retro)
+#   MAX_TURNS          tool-use turns per traj   (default: 100)
+#   FORCE_NOLOOP       True | False              (default: True)
+#   VAL_BATCH_SIZE                                (default: 128)
+#   VAL_RESUME         True | False              (default: True)
+#   TP_SIZE            tensor-parallel size      (default: from CUDA_VISIBLE_DEVICES, fallback 4)
+#   LOCAL_API_PORT     vLLM port                 (default: 20011)
+#   API_MODEL_NAME     name advertised to vLLM   (default: retro_sft_full)
+#   VLLM_MAX_MODEL_LEN vLLM --max-model-len      (default: 65536)
+#   GPU_MEM_UTIL       --gpu-memory-utilization  (default: 0.85)
+#   SKIP_MERGE         skip step 1 even if dir missing (default: 0)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+
+# ======================================
+# Eval config (mirrors run_eval_rjob.sh)
+# ======================================
+DATASET="${DATASET:-retro}"
+MAX_TURNS="${MAX_TURNS:-100}"
+FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
+VAL_RESUME="${VAL_RESUME:-True}"
+
+case "$DATASET" in
+    chembl) VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet" ;;
+    retro)  VAL_FILES="./data/reaction_pathway_search/validation_retro_190.parquet" ;;
+    *) echo "ERROR: unknown DATASET='$DATASET' (expected 'chembl' or 'retro')" >&2; exit 1 ;;
+esac
+
+# ======================================
+# Model paths
+# ======================================
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/shared-storage-user/ai4cmp/models/0401-preview}"
+ADAPTER_DIR="${ADAPTER_DIR:-/mnt/shared-storage-gpfs2/wangzifugpfs2/LlamaFactory_saves/retro_sft/full/0401-preview/lora/20260425_235107_20085}"
+# Default merged dir: sibling "merged" under the adapter's run dir.
+MERGED_DIR="${MERGED_DIR:-${ADAPTER_DIR}/merged}"
+SKIP_MERGE="${SKIP_MERGE:-0}"
+
+API_MODEL_NAME="${API_MODEL_NAME:-retro_sft_full}"
+
+# ======================================
+# Local vLLM endpoint
+# ======================================
+LOCAL_API_HOST="${LOCAL_API_HOST:-127.0.0.1}"
+LOCAL_API_PORT="${LOCAL_API_PORT:-20011}"
+LOCAL_API_URL="http://${LOCAL_API_HOST}:${LOCAL_API_PORT}/v1"
+
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-1800}"   # seconds
+
+# Tensor-parallel: default to count of visible GPUs (or 4 if unset).
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]]; then
+    DETECTED_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')
+else
+    DETECTED_GPUS=4
+fi
+TP_SIZE="${TP_SIZE:-$DETECTED_GPUS}"
+
+# ======================================
+# Conda envs
+# ======================================
+CONDA_BASE="${CONDA_BASE:-/mnt/shared-storage-gpfs2/wangzifugpfs2/miniconda3}"
+LF_ENV="${LF_ENV:-LlamaFactory}"
+EVAL_ENV="${CONDA_ENV:-qwen35_vllm}"
+
+if [[ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+    echo "ERROR: conda.sh not found under CONDA_BASE='$CONDA_BASE'." >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+# ======================================
+# Logging
+# ======================================
+mkdir -p logs
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
+ADAPTER_TAG="$(basename "$ADAPTER_DIR")"
+VAL_TAG="$(basename "$VAL_FILES" .parquet)"
+EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}_local_${ADAPTER_TAG}"
+
+DEFAULT_CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_local-${ADAPTER_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$DEFAULT_CHECKPOINT_DIR}"
+
+EVAL_LOG="logs/local_eval_${DATASET}_${ADAPTER_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_run-${RUN_ID}.log"
+VLLM_LOG="logs/vllm_${ADAPTER_TAG}_run-${RUN_ID}.log"
+MERGE_LOG="logs/merge_${ADAPTER_TAG}_run-${RUN_ID}.log"
+
+echo "=== Run Config ==="
+echo "RUN_ID=$RUN_ID"
+echo "HOSTNAME=$(hostname)"
+echo "PWD=$(pwd)"
+echo "DATASET=$DATASET    VAL_FILES=$VAL_FILES"
+echo "BASE_MODEL_PATH=$BASE_MODEL_PATH"
+echo "ADAPTER_DIR=$ADAPTER_DIR"
+echo "MERGED_DIR=$MERGED_DIR"
+echo "API_MODEL_NAME=$API_MODEL_NAME"
+echo "LOCAL_API_URL=$LOCAL_API_URL"
+echo "TP_SIZE=$TP_SIZE   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
+echo "VLLM_MAX_MODEL_LEN=$VLLM_MAX_MODEL_LEN  GPU_MEM_UTIL=$GPU_MEM_UTIL"
+echo "MAX_TURNS=$MAX_TURNS  FORCE_NOLOOP=$FORCE_NOLOOP  VAL_BATCH_SIZE=$VAL_BATCH_SIZE  VAL_RESUME=$VAL_RESUME"
+echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
+echo "EVAL_LOG=$EVAL_LOG"
+echo "VLLM_LOG=$VLLM_LOG"
+echo "MERGE_LOG=$MERGE_LOG"
+echo "==================="
+
+command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
+
+# ======================================
+# Step 1: merge LoRA into base (one-time; cached)
+# ======================================
+need_merge=1
+if [[ -f "$MERGED_DIR/config.json" ]] && \
+   ls "$MERGED_DIR"/*.safetensors >/dev/null 2>&1; then
+    need_merge=0
+fi
+if [[ "$SKIP_MERGE" == "1" ]]; then
+    echo "[merge] SKIP_MERGE=1; assuming MERGED_DIR is ready."
+    need_merge=0
+fi
+
+if [[ $need_merge -eq 1 ]]; then
+    echo "[merge] merging LoRA -> $MERGED_DIR (env=$LF_ENV)"
+    mkdir -p "$MERGED_DIR"
+    MERGE_YAML="$MERGED_DIR/_export_config.yaml"
+    cat > "$MERGE_YAML" <<YAML_EOF
+### Auto-generated by run_eval_local.sh — LoRA merge config
+model_name_or_path: ${BASE_MODEL_PATH}
+adapter_name_or_path: ${ADAPTER_DIR}
+template: qwen3_5
+finetuning_type: lora
+trust_remote_code: true
+
+export_dir: ${MERGED_DIR}
+export_size: 5
+export_device: cpu
+export_legacy_format: false
+YAML_EOF
+    echo "[merge] config:"
+    cat "$MERGE_YAML"
+
+    conda activate "$LF_ENV"
+    HF_HUB_OFFLINE=1 llamafactory-cli export "$MERGE_YAML" 2>&1 | tee "$MERGE_LOG"
+    EXPORT_RC=${PIPESTATUS[0]}
+    conda deactivate
+    if [[ $EXPORT_RC -ne 0 ]]; then
+        echo "[merge] ERROR: llamafactory-cli export failed (rc=$EXPORT_RC). See $MERGE_LOG" >&2
+        exit $EXPORT_RC
+    fi
+    # Sanity: the export directory normally lacks the python files for custom
+    # archs. Copy any *.py from base if missing so trust_remote_code keeps working.
+    for f in "$BASE_MODEL_PATH"/*.py; do
+        [[ -e "$f" ]] || continue
+        bn="$(basename "$f")"
+        [[ -e "$MERGED_DIR/$bn" ]] || cp "$f" "$MERGED_DIR/$bn"
+    done
+    echo "[merge] done -> $MERGED_DIR"
+else
+    echo "[merge] reusing existing merged model at $MERGED_DIR"
+fi
+
+# ======================================
+# Step 2: launch vLLM in background
+# ======================================
+conda activate "$EVAL_ENV"
+
+cleanup() {
+    rc=$?
+    if [[ -n "${VLLM_PID:-}" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        echo "[cleanup] stopping vLLM (pid=$VLLM_PID) ..."
+        kill -TERM "$VLLM_PID" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+            kill -0 "$VLLM_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$VLLM_PID" 2>/dev/null; then
+            echo "[cleanup] vLLM did not exit; sending KILL"
+            kill -KILL "$VLLM_PID" 2>/dev/null || true
+        fi
+    fi
+    exit $rc
+}
+trap cleanup EXIT INT TERM
+
+echo "[vllm] launching on ${LOCAL_API_HOST}:${LOCAL_API_PORT} (TP=$TP_SIZE)"
+# Note: --served-model-name controls the value the API expects in `model=...`.
+# We pin it to API_MODEL_NAME so the eval framework's API_MODEL_NAME flag matches.
+nohup env HF_HUB_OFFLINE=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    vllm serve "$MERGED_DIR" \
+    --host "$LOCAL_API_HOST" \
+    --port "$LOCAL_API_PORT" \
+    --served-model-name "$API_MODEL_NAME" \
+    --tensor-parallel-size "$TP_SIZE" \
+    --max-model-len "$VLLM_MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --trust-remote-code \
+    --dtype bfloat16 \
+    --disable-uvicorn-access-log \
+    --disable-log-stats \
+    > "$VLLM_LOG" 2>&1 &
+VLLM_PID=$!
+echo "[vllm] pid=$VLLM_PID  log=$VLLM_LOG"
+
+# Wait for /v1/models to respond. vLLM startup for a 60GB+ MoE model can take
+# a few minutes; bound it with VLLM_READY_TIMEOUT.
+echo "[vllm] waiting for readiness (timeout=${VLLM_READY_TIMEOUT}s) ..."
+ready=0
+for i in $(seq 1 "$VLLM_READY_TIMEOUT"); do
+    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+        echo "[vllm] ERROR: process exited before becoming ready. Tail of log:" >&2
+        tail -n 80 "$VLLM_LOG" >&2 || true
+        exit 1
+    fi
+    if curl -sf --max-time 2 "${LOCAL_API_URL}/models" >/dev/null 2>&1; then
+        ready=1
+        echo "[vllm] ready after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $ready -ne 1 ]]; then
+    echo "[vllm] ERROR: not ready after ${VLLM_READY_TIMEOUT}s. Tail of log:" >&2
+    tail -n 100 "$VLLM_LOG" >&2 || true
+    exit 1
+fi
+curl -s "${LOCAL_API_URL}/models" || true
+echo
+
+# ======================================
+# Step 3: run validation against local endpoint
+# ======================================
+export pjlab_APImodel_key="EMPTY"
+export pjlab_APImodel_url="${LOCAL_API_URL}"
+export CPATH="/usr/include:${CPATH:-}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+
+# Tokenizer is loaded from the merged model so it matches what vLLM serves.
+EVAL_MODEL_PATH="${EVAL_MODEL_PATH:-$MERGED_DIR}"
+
+NNODES="${NNODES:-1}"
+GPUS_PER_NODE=0   # eval runs CPU-only; all GPUs are reserved by vLLM.
+
+echo "=== Eval ==="
+echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
+echo "API_MODEL_NAME=$API_MODEL_NAME"
+echo "API_URL=$pjlab_APImodel_url"
+echo "EVAL_MODEL_PATH=$EVAL_MODEL_PATH"
+echo "EVAL_LOG=$EVAL_LOG"
+echo "============"
+
+PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
+    data.val_files="$VAL_FILES" \
+    data.max_prompt_length=32768 \
+    data.max_response_length=32768 \
+    data.max_start_length=1024 \
+    data.max_tool_response_length=4096 \
+    data.val_batch_size="$VAL_BATCH_SIZE" \
+    actor_rollout_ref.model.path="$EVAL_MODEL_PATH" \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    trainer.default_local_dir="$CHECKPOINT_DIR" \
+    trainer.val_resume="$VAL_RESUME" \
+    trainer.logger="['console']" \
+    trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
+    trainer.n_gpus_per_node="$GPUS_PER_NODE" \
+    trainer.nnodes="$NNODES" \
+    tool.debug=True \
+    tool.api_max_concurrency=128 \
+    tool.max_turns="$MAX_TURNS" \
+    tool.topk=10 \
+    tool.shuffle=False \
+    tool.maxstep=30 \
+    tool.force_noloop="$FORCE_NOLOOP" \
+    tool.use_batch_tool_calls=False \
+    tool.env='retro_noback_V4' \
+    tool.use_api_model=True \
+    tool.api_model_name="$API_MODEL_NAME" \
+    2>&1 | tee "$EVAL_LOG"
+EVAL_RC=${PIPESTATUS[0]}
+
+echo "[eval] finished with rc=$EVAL_RC"
+exit $EVAL_RC

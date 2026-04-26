@@ -316,9 +316,9 @@ dependencies:
       - tqdm==4.67.1
       # 等环境建好、torch 正常后，手动在环境里装，例如：
       # pip install --no-build-isolation transformer-engine==2.1.0 transformer-engine-cu12==2.1.0 transformer-engine-torch==2.1.0
-      - transformer-engine==2.1.0
-      - transformer-engine-cu12==2.1.0
-      - transformer-engine-torch==2.1.0
+      # - transformer-engine==2.1.0
+      # - transformer-engine-cu12==2.1.0
+      # - transformer-engine-torch==2.1.0
       - transformers==4.51.3
       - trec-car-tools==2.6
       - triton==3.2.0
