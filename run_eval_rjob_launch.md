@@ -22,11 +22,11 @@ rjob submit --name=sft-collect-train-h4-10-noloopFalse-noback --gpu=0 --memory=3
 
 # 可回溯对照组（BACKTRACK=true 走 main_agent_retro + tool.env=retro，启用 back_state 工具）。
 # 注意：BACKTRACK=true 时 FORCE_NOLOOP 仅作为 Hydra 配置被写入但不被读取。
-rjob submit --name=sft-collect-train-h4-10-noloopTrue-back --gpu=0 --memory=32000 --cpu=16 --charged-group=ai4cmp_gpu --private-machine=group \
+rjob submit --name=sft-collect-train-h4-10-noloopTrue-back --gpu=0 --memory=16000 --cpu=8 --charged-group=ai4cmp_gpu --private-machine=group \
   --mount=gpfs://gpfs1/wangzifu:/mnt/shared-storage-user/wangzifu \
   --mount=gpfs://gpfs2/wangzifugpfs2:/mnt/shared-storage-gpfs2/wangzifugpfs2 \
   --image=registry.h.pjlab.org.cn/ailab/ml-base:22.04-pjlab \
-  -e DATASET=train_h4_10 -e BACKTRACK=true -e MAX_TURNS=100 -e FORCE_NOLOOP=True -e API_MODEL_NAME=A1-preview -e VAL_BATCH_SIZE=32 -e VAL_RESUME=True \
+  -e DATASET=train_h4_10 -e BACKTRACK=true -e MAX_TURNS=100 -e API_MODEL_NAME=A1-preview -e VAL_BATCH_SIZE=32 -e VAL_RESUME=True \
   -e ROLLOUT_N=8 -e ROLLOUT_TEMP=0.7 -e ROLLOUT_TOPP=1.0 -e SFT_SAVE_EVERY=50 -- \
   bash -exc "/mnt/shared-storage-gpfs2/wangzifugpfs2/Agent-r1-temp/run_eval_rjob.sh"
 ```

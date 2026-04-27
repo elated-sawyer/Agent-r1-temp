@@ -106,7 +106,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 # export pjlab_APImodel_url="${!API_URL_VAR:-}"
 # ------------------------------------------------------------------
 export pjlab_APImodel_key="EMPTY"
-export pjlab_APImodel_url="http://100.104.48.113:20010/v1"
+export pjlab_APImodel_url="http://10.102.205.38:20010/v1"
 # ------------------------------------------------------------------
 
 echo "=== Run Config ==="

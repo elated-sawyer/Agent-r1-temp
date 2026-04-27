@@ -37,7 +37,8 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=False,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         return result, reward, False, {"action_is_valid": False, "action_is_effective": False}
     
@@ -53,10 +54,11 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=True,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         return result, reward, False, {"action_is_valid": True, "action_is_effective": False}
-    
+
 
     is_valid, error_msg = env.check_tool_applicability(tool_name)
     if not is_valid:
@@ -67,13 +69,14 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=True,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         return result, reward, False, {"action_is_valid": True, "action_is_effective": False}
-    
+
     # Get tool instance
     tool = env.tool_map[tool_name]
-    
+
     # Validate tool arguments
     is_valid, error_msg = tool.validate_args(tool_args)
     if not is_valid:
@@ -84,10 +87,11 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=True,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         return result, reward, False, {"action_is_valid": True, "action_is_effective": False}
-    
+
     env_tool_args, is_valid, error_msg = env.wrap_tool_args(tool_name, tool_args)
     if not is_valid:
         result = f"Invalid arguments for tool '{tool_name}': {error_msg}"
@@ -97,7 +101,8 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=True,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         return result, reward, False, {"action_is_valid": True, "action_is_effective": False}
         
@@ -112,7 +117,8 @@ def step(env: 'ToolEnvRetro', action_text: str):
                 action=action,
                 action_is_valid=True,
                 action_is_effective=False,
-                reward=reward
+                reward=reward,
+                tool_response=env_result,
             )
             return env_result, reward, False, {"action_is_valid": True, "action_is_effective": False}
         # env_result = env.result2text(env_tool_args, result)
@@ -138,21 +144,23 @@ def step(env: 'ToolEnvRetro', action_text: str):
             action=action,
             action_is_valid=True,
             action_is_effective=True,
-            reward=reward
+            reward=reward,
+            tool_response=env_result,
         )
-        
+
         return env_result, reward, done, {"action_is_valid": True, "action_is_effective": True} # TODO: change if error
     except Exception as e:
         error_trace = traceback.format_exc()
         result = f"Error executing tool '{tool_name}': {str(e)}"
         reward = env.PENALTY_FOR_INEFFECTIVE  # Runtime error penalty
-        
+
         env._update_tracking_variables(
             response=action_text,
             action=action,
             action_is_valid=True,
             action_is_effective=False,
-            reward=reward
+            reward=reward,
+            tool_response=result,
         )
         
         return result, reward, False, {"action_is_valid": True, "action_is_effective": False}
@@ -410,8 +418,11 @@ For each function call, return a json object with function name and arguments wi
         self._actions = []  # All actions (including all LLM responses)
         self._actions_valid = []  # Correctly formatted actions
         self._actions_effective = []  # Effectively executed actions
+        # One raw tool-response string per entry in self._actions. Used to
+        # reconstruct the full multi-turn conversation for SFT collection.
+        self._tool_responses = []
 
-        
+
         if self.target:
             self.idx = 1
             self.state_relation = [[], [], []]
@@ -450,6 +461,7 @@ For each function call, return a json object with function name and arguments wi
             "actions": self._actions,
             "actions_valid": self._actions_valid,
             "actions_effective": self._actions_effective,
+            "tool_responses": self._tool_responses,
             "idx": self.idx,
             "state_relation": self.state_relation,
             "unsolved_dict": self.unsolved_dict,
@@ -463,25 +475,46 @@ For each function call, return a json object with function name and arguments wi
             "count_totaltry": self.count_totaltry,
             "back_flag": self.back_flag,
         }
-    
+
+    def get_conversation_messages(self) -> List[Dict[str, str]]:
+        """Return the assistant/tool turn trace for this rollout.
+
+        Each assistant turn is the raw LLM response text captured in
+        ``self._actions``. Each tool turn is the raw observation string the
+        env returned from ``step()`` (before the chat-template wrapping done
+        by ``ToolGenerationManager``). The returned list is the trailing
+        portion of a chat conversation; the SFT record prepends the
+        system/user messages from the dataset to produce the final schema.
+        """
+        messages: List[Dict[str, str]] = []
+        for assistant_text, tool_text in zip(self._actions, self._tool_responses):
+            messages.append({"role": "assistant", "content": assistant_text})
+            messages.append({"role": "tool", "content": tool_text})
+        return messages
+
     def _update_tracking_variables(
-            self, 
+            self,
             response: str,
-            action: Any, 
+            action: Any,
             action_is_valid: bool,
             action_is_effective: bool,
             reward: float,
+            tool_response: str = "",
         ):
         """
         Update tracking variables
-        
+
         Args:
             response: Raw LLM response
             action: Parsed action
             action_is_valid: Whether the action format is syntactically valid (proper JSON, correct tool call syntax)
             action_is_effective: Whether the action was semantically valid and successfully executed
             reward: Reward for the current step (including any penalties)
-            
+            tool_response: The raw observation / tool-response string returned
+                by this step. Tracked in parallel with ``self._actions`` so
+                the full multi-turn trace can be reconstructed for SFT data
+                collection without relying on the templated rolling state.
+
         Note:
             - action_is_valid=True means the action was properly formatted, but doesn't guarantee it can be executed
             - action_is_effective=True means the action was both valid and successfully executed
@@ -496,8 +529,9 @@ For each function call, return a json object with function name and arguments wi
             self._actions_effective.append(action)
         else:
             self._actions_effective.append(None)
-        
+
         self.rewards.append(reward)
+        self._tool_responses.append(tool_response)
     
     def extract_tool_call(self, text: str) -> Dict:
         """
