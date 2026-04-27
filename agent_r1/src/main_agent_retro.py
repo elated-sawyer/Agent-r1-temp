@@ -21,6 +21,7 @@ from agent_r1.tool.tools import _default_tools
 
 import ray
 import hydra
+from omegaconf import OmegaConf
 
 from verl import DataProto
 from .reward_score import _default_compute_score_format, _default_compute_score_answer, _default_compute_score_format_answer, _default_compute_all_score, _default_compute_all_score_back
@@ -104,9 +105,45 @@ class RewardManager():
 
         return reward_tensor, end_lst, answer_lst, format_lst
 
+def run_api_validation(config) -> None:
+    """API-only validation (same as main_agent_retro_noback) with ToolEnvRetro + back rewards."""
+    from verl.utils.fs import copy_to_local
+    from pprint import pprint
+    from .agent_ray_trainer_retro_noback import ValidationPipeline
+
+    pprint(OmegaConf.to_container(config, resolve=True))
+    OmegaConf.resolve(config)
+
+    local_path = copy_to_local(config.actor_rollout_ref.model.path)
+    from verl.utils import hf_tokenizer, hf_processor
+    tokenizer = hf_tokenizer(local_path)
+    processor = hf_processor(local_path, use_fast=True)
+
+    tools = _default_tools(config.tool.env)
+    env = ToolEnvRetro(
+        tools=tools,
+        max_turns=config.tool.max_turns,
+        maxstep=config.tool.maxstep,
+        topk=config.tool.topk,
+        shuffle=config.tool.shuffle,
+    )
+    num_examine = 2
+    pipeline = ValidationPipeline(
+        config=config,
+        tokenizer=tokenizer,
+        processor=processor,
+        val_reward_fn=RewardManager(tokenizer=tokenizer, num_examine=num_examine),
+        env=env,
+    )
+    pipeline.run()
+
+
 @hydra.main(config_path='config', config_name='agent_trainer', version_base=None)
 def main(config):
-    run_agent(config)
+    if OmegaConf.select(config, 'tool.use_api_model', default=False):
+        run_api_validation(config)
+    else:
+        run_agent(config)
 
 
 def run_agent(config) -> None:

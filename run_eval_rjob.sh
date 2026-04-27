@@ -5,7 +5,11 @@ set -euo pipefail
 # regardless of the cwd chosen by rjob.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+# verl/ is the pyproject root; the importable package is verl/verl/. If only SCRIPT_DIR
+# is on PYTHONPATH, "import verl" resolves to SCRIPT_DIR/verl (no __init__.py) and breaks
+# DataProto. Put the real package parent first, then the repo root for agent_r1.
+# Local packages (see README: pip install -e packages/...). PYTHONPATH avoids missing editable installs.
+export PYTHONPATH="${SCRIPT_DIR}/packages/rdchiral:${SCRIPT_DIR}/packages/mlp_retrosyn:${SCRIPT_DIR}/verl:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 # ======================================
 # Configurable parameters (override via env):
@@ -18,6 +22,7 @@ export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 # ======================================
 
 DATASET="${DATASET:-retro}"
+BACKTRACK="${BACKTRACK:-false}"
 MAX_TURNS="${MAX_TURNS:-100}"
 FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
 API_MODEL_NAME="${API_MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
@@ -40,19 +45,39 @@ case "$DATASET" in
         ;;
 esac
 
+# BACKTRACK picks the main module and the tool.env value:
+#   true  -> ToolEnvRetro       (back_state tool enabled)
+#   false -> ToolEnvRetroNoBack (no back_state; force_noloop applies)
+case "$BACKTRACK" in
+    true|True|TRUE|1)
+        MAIN_MODULE="agent_r1.src.main_agent_retro"
+        TOOL_ENV_NAME="retro"
+        BACK_TAG="back"
+        ;;
+    false|False|FALSE|0)
+        MAIN_MODULE="agent_r1.src.main_agent_retro_noback"
+        TOOL_ENV_NAME="retro_noback_V4"
+        BACK_TAG="noback"
+        ;;
+    *)
+        echo "ERROR: BACKTRACK='$BACKTRACK' (expected true|false)" >&2
+        exit 1
+        ;;
+esac
+
 API_LOG_TAG="${API_MODEL_NAME//\//_}"
 VAL_TAG="$(basename "$VAL_FILES" .parquet)"
-EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}"
+EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}_${BACK_TAG}"
 
 # Stable path for resume
-DEFAULT_CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}"
+DEFAULT_CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_${BACK_TAG}_noloop-${FORCE_NOLOOP}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$DEFAULT_CHECKPOINT_DIR}"
 
 mkdir -p logs
 
 # rjob 下通常没有 SLURM_JOB_ID，这里自己生成一个
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
-LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_run-${RUN_ID}.log"
+LOG_FILE="logs/test_${DATASET}_api-${API_LOG_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_${BACK_TAG}_noloop-${FORCE_NOLOOP}_run-${RUN_ID}.log"
 
 # ======================================
 # Runtime / cluster info
@@ -83,6 +108,7 @@ export pjlab_APImodel_url="http://100.104.48.113:20010/v1"
 
 echo "=== Run Config ==="
 echo "DATASET=$DATASET"
+echo "BACKTRACK=$BACKTRACK  MAIN_MODULE=$MAIN_MODULE  TOOL_ENV_NAME=$TOOL_ENV_NAME"
 echo "VAL_FILES=$VAL_FILES"
 echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
@@ -119,7 +145,7 @@ conda activate "${CONDA_ENV:-Retro_R1}"
 # ======================================
 # Run validation-only pipeline
 # ======================================
-PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
+PYTHONUNBUFFERED=1 python3 -m "$MAIN_MODULE" \
     data.val_files="$VAL_FILES" \
     data.max_prompt_length=32768 \
     data.max_response_length=32768 \
@@ -145,7 +171,7 @@ PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
     tool.maxstep=30 \
     tool.force_noloop="$FORCE_NOLOOP" \
     tool.use_batch_tool_calls=False \
-    tool.env='retro_noback_V4' \
+    tool.env="$TOOL_ENV_NAME" \
     tool.use_api_model=True \
     tool.api_model_name="$API_MODEL_NAME" \
     2>&1 | tee "$LOG_FILE"

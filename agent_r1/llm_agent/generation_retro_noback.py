@@ -23,7 +23,7 @@ except ImportError:
 
 from .tensor_helper import TensorHelper, TensorConfig
 # from agent_r1.tool.tool_env import ToolEnv, step, step_batch
-from agent_r1.tool.tool_env_retro_noback import ToolEnvRetroNoBack, step
+from agent_r1.tool.tool_env_retro_noback import ToolEnvRetroNoBack
 
 from verl import DataProto
 from verl.utils.tracking import Tracking
@@ -48,6 +48,8 @@ class ToolGenerationConfig:
     api_model_name: str = ""
     api_max_concurrency: int = 32
     debug: bool = False
+    # "noback" = tool_env_retro_noback.step; "back" = tool_env_retro.step (with back_state)
+    tool_env_mode: str = "noback"
 
 class ToolGenerationManager:
     """Manager for handling LLM tool-based generation and interaction"""
@@ -71,6 +73,11 @@ class ToolGenerationManager:
             max_start_length=config.max_start_length,
         ))
         self._api_client = self._build_api_client() if config.use_api_model else None
+        if getattr(config, "tool_env_mode", "noback") == "back":
+            from agent_r1.tool import tool_env_retro as _env_mod
+        else:
+            from agent_r1.tool import tool_env_retro_noback as _env_mod
+        self._step_fn = _env_mod.step
 
     def _build_api_client(self):
         if AsyncOpenAI is None:
@@ -189,7 +196,7 @@ class ToolGenerationManager:
                 
             # Step the environment using the agent's response
 
-            result = step(env, resp)
+            result = self._step_fn(env, resp)
             
             tool_response = result[0]  # Extract observation from (observation, reward, done, info)
             tool_responses[i] = self.config.tool_custom_response_template.format(tool_response=tool_response)            

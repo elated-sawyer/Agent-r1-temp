@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
-# Run the validation pipeline directly on this compute node (no rjob).
+# Launch the local vLLM service for the merged model (no eval).
 #
 # Pipeline:
 #   1. Merge the LoRA adapter into the base model with `llamafactory-cli export`
 #      (one-time; cached under MERGED_DIR). Skipped if MERGED_DIR already exists.
-#   2. Start vLLM (`vllm serve`) in the background, serving the merged model on
-#      LOCAL_API_PORT. Wait until /v1/models is responsive.
-#   3. Run agent_r1.src.main_agent_retro_noback against the local endpoint.
-#   4. On exit, stop the vLLM server (TERM, then KILL after a grace window).
+#   2. Start vLLM (`vllm serve`) in the foreground, serving the merged model on
+#      LOCAL_API_PORT. Wait until /v1/models is responsive, then keep running
+#      until the user stops it (Ctrl-C / SIGTERM).
 #
 # The merge step uses the LlamaFactory conda env (knows the custom Qwen3_5
-# architecture). Serving and eval use the Retro_R1 env (has vllm + agent_r1).
+# architecture). Serving uses the Retro_R1 env (has vllm).
 #
 # Override anything via env vars. Common ones:
 #   ADAPTER_DIR        path to the LoRA adapter directory
 #   MERGED_DIR         where to save the merged model (cached)
 #   BASE_MODEL_PATH    base model used during SFT
-#   DATASET            chembl | retro            (default: retro)
-#   MAX_TURNS          tool-use turns per traj   (default: 100)
-#   FORCE_NOLOOP       True | False              (default: True)
-#   VAL_BATCH_SIZE                                (default: 128)
-#   VAL_RESUME         True | False              (default: True)
 #   TP_SIZE            tensor-parallel size      (default: from CUDA_VISIBLE_DEVICES, fallback 4)
 #   LOCAL_API_PORT     vLLM port                 (default: 20011)
 #   API_MODEL_NAME     name advertised to vLLM   (default: retro_sft_full)
@@ -32,22 +26,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+# See run_eval_rjob.sh: rdchiral, mlp_retrosyn, verl, then repo root.
+export PYTHONPATH="${SCRIPT_DIR}/packages/rdchiral:${SCRIPT_DIR}/packages/mlp_retrosyn:${SCRIPT_DIR}/verl:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# ======================================
-# Eval config (mirrors run_eval_rjob.sh)
-# ======================================
-DATASET="${DATASET:-retro}"
-MAX_TURNS="${MAX_TURNS:-100}"
-FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
-VAL_RESUME="${VAL_RESUME:-True}"
 
-case "$DATASET" in
-    chembl) VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet" ;;
-    retro)  VAL_FILES="./data/reaction_pathway_search/validation_retro_190.parquet" ;;
-    *) echo "ERROR: unknown DATASET='$DATASET' (expected 'chembl' or 'retro')" >&2; exit 1 ;;
-esac
+# --- CUDA toolchain from shared GPFS ---
+export CUDA_HOME=/mnt/shared-storage-gpfs2/gpfs2-shared-public/soft/cuda/12.8
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 
 # ======================================
 # Model paths
@@ -84,7 +70,7 @@ TP_SIZE="${TP_SIZE:-$DETECTED_GPUS}"
 # ======================================
 CONDA_BASE="${CONDA_BASE:-/mnt/shared-storage-gpfs2/wangzifugpfs2/miniconda3}"
 LF_ENV="${LF_ENV:-LlamaFactory}"
-EVAL_ENV="${CONDA_ENV:-qwen35_vllm}"
+SERVE_ENV="${CONDA_ENV:-qwen35_vllm}"
 
 if [[ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
     echo "ERROR: conda.sh not found under CONDA_BASE='$CONDA_BASE'." >&2
@@ -99,13 +85,7 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 mkdir -p logs
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 ADAPTER_TAG="$(basename "$ADAPTER_DIR")"
-VAL_TAG="$(basename "$VAL_FILES" .parquet)"
-EXPERIMENT_NAME="ppo_retro_test190_t0_${DATASET}_local_${ADAPTER_TAG}"
 
-DEFAULT_CHECKPOINT_DIR="./checkpoints/val/test_${DATASET}_local-${ADAPTER_TAG}_val-${VAL_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$DEFAULT_CHECKPOINT_DIR}"
-
-EVAL_LOG="logs/local_eval_${DATASET}_${ADAPTER_TAG}_turns-${MAX_TURNS}_noloop-${FORCE_NOLOOP}_run-${RUN_ID}.log"
 VLLM_LOG="logs/vllm_${ADAPTER_TAG}_run-${RUN_ID}.log"
 MERGE_LOG="logs/merge_${ADAPTER_TAG}_run-${RUN_ID}.log"
 
@@ -113,7 +93,6 @@ echo "=== Run Config ==="
 echo "RUN_ID=$RUN_ID"
 echo "HOSTNAME=$(hostname)"
 echo "PWD=$(pwd)"
-echo "DATASET=$DATASET    VAL_FILES=$VAL_FILES"
 echo "BASE_MODEL_PATH=$BASE_MODEL_PATH"
 echo "ADAPTER_DIR=$ADAPTER_DIR"
 echo "MERGED_DIR=$MERGED_DIR"
@@ -121,9 +100,6 @@ echo "API_MODEL_NAME=$API_MODEL_NAME"
 echo "LOCAL_API_URL=$LOCAL_API_URL"
 echo "TP_SIZE=$TP_SIZE   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
 echo "VLLM_MAX_MODEL_LEN=$VLLM_MAX_MODEL_LEN  GPU_MEM_UTIL=$GPU_MEM_UTIL"
-echo "MAX_TURNS=$MAX_TURNS  FORCE_NOLOOP=$FORCE_NOLOOP  VAL_BATCH_SIZE=$VAL_BATCH_SIZE  VAL_RESUME=$VAL_RESUME"
-echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
-echo "EVAL_LOG=$EVAL_LOG"
 echo "VLLM_LOG=$VLLM_LOG"
 echo "MERGE_LOG=$MERGE_LOG"
 echo "==================="
@@ -184,9 +160,9 @@ else
 fi
 
 # ======================================
-# Step 2: launch vLLM in background
+# Step 2: launch vLLM and block until stopped
 # ======================================
-conda activate "$EVAL_ENV"
+conda activate "$SERVE_ENV"
 
 cleanup() {
     rc=$?
@@ -206,10 +182,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+
 echo "[vllm] launching on ${LOCAL_API_HOST}:${LOCAL_API_PORT} (TP=$TP_SIZE)"
 # Note: --served-model-name controls the value the API expects in `model=...`.
-# We pin it to API_MODEL_NAME so the eval framework's API_MODEL_NAME flag matches.
-nohup env HF_HUB_OFFLINE=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+# We pin it to API_MODEL_NAME so downstream clients' model flag matches.
+env HF_HUB_OFFLINE=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
     vllm serve "$MERGED_DIR" \
     --host "$LOCAL_API_HOST" \
     --port "$LOCAL_API_PORT" \
@@ -249,60 +227,9 @@ if [[ $ready -ne 1 ]]; then
 fi
 curl -s "${LOCAL_API_URL}/models" || true
 echo
+echo "[vllm] serving at ${LOCAL_API_URL}  (model=${API_MODEL_NAME})"
+echo "[vllm] tailing log; press Ctrl-C to stop the server."
 
-# ======================================
-# Step 3: run validation against local endpoint
-# ======================================
-export pjlab_APImodel_key="EMPTY"
-export pjlab_APImodel_url="${LOCAL_API_URL}"
-export CPATH="/usr/include:${CPATH:-}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
-
-# Tokenizer is loaded from the merged model so it matches what vLLM serves.
-EVAL_MODEL_PATH="${EVAL_MODEL_PATH:-$MERGED_DIR}"
-
-NNODES="${NNODES:-1}"
-GPUS_PER_NODE=0   # eval runs CPU-only; all GPUs are reserved by vLLM.
-
-echo "=== Eval ==="
-echo "EXPERIMENT_NAME=$EXPERIMENT_NAME"
-echo "API_MODEL_NAME=$API_MODEL_NAME"
-echo "API_URL=$pjlab_APImodel_url"
-echo "EVAL_MODEL_PATH=$EVAL_MODEL_PATH"
-echo "EVAL_LOG=$EVAL_LOG"
-echo "============"
-
-PYTHONUNBUFFERED=1 python3 -m agent_r1.src.main_agent_retro_noback \
-    data.val_files="$VAL_FILES" \
-    data.max_prompt_length=32768 \
-    data.max_response_length=32768 \
-    data.max_start_length=1024 \
-    data.max_tool_response_length=4096 \
-    data.val_batch_size="$VAL_BATCH_SIZE" \
-    actor_rollout_ref.model.path="$EVAL_MODEL_PATH" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
-    trainer.default_local_dir="$CHECKPOINT_DIR" \
-    trainer.val_resume="$VAL_RESUME" \
-    trainer.logger="['console']" \
-    trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
-    trainer.experiment_name="$EXPERIMENT_NAME" \
-    trainer.n_gpus_per_node="$GPUS_PER_NODE" \
-    trainer.nnodes="$NNODES" \
-    tool.debug=True \
-    tool.api_max_concurrency=128 \
-    tool.max_turns="$MAX_TURNS" \
-    tool.topk=10 \
-    tool.shuffle=False \
-    tool.maxstep=30 \
-    tool.force_noloop="$FORCE_NOLOOP" \
-    tool.use_batch_tool_calls=False \
-    tool.env='retro_noback_V4' \
-    tool.use_api_model=True \
-    tool.api_model_name="$API_MODEL_NAME" \
-    2>&1 | tee "$EVAL_LOG"
-EVAL_RC=${PIPESTATUS[0]}
-
-echo "[eval] finished with rc=$EVAL_RC"
-exit $EVAL_RC
+# Block on the vLLM process so the script stays up until the server exits
+# (or the user interrupts us, triggering cleanup).
+wait "$VLLM_PID"
