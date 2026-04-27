@@ -269,7 +269,9 @@ class ValidationPipeline(object):
                 try:
                     reward_tensor, end_lst, answer_lst, format_lst = self.val_reward_fn(test_batch, envs)
                 except Exception:
+                    import traceback
                     print(f"[Error] Something wrong with the reward function")
+                    traceback.print_exc()
                     print(test_batch)
                     exit()
 
