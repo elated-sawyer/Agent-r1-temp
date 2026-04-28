@@ -56,10 +56,10 @@ def _default_compute_all_score_back(data_source, solution_str, ground_truth, env
     if data_source == 'reaction_pathway_search':
         try:
             from . import reaction_pathway_reward_back
-        except ModuleNotFoundError:
+        except ImportError:
             # reaction_pathway_reward_back is not present on this branch.
-            # Fall back to the back-agnostic scorer so BACKTRACK=true runs still
-            # get a numeric reward (same scoring rubric as BACKTRACK=false).
+            # `from . import X` raises bare ImportError (not ModuleNotFoundError)
+            # when X is a missing submodule, so catch the superclass.
             from . import reaction_pathway_reward as reaction_pathway_reward_back
         score, end_score, answer_score, format_score = reaction_pathway_reward_back.compute_all_score(solution_str, ground_truth, env)
         return score, end_score, answer_score, format_score

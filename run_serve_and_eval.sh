@@ -57,6 +57,10 @@ MAX_TURNS="${MAX_TURNS:-100}"
 FORCE_NOLOOP="${FORCE_NOLOOP:-True}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 VAL_RESUME="${VAL_RESUME:-True}"
+# Number of times to re-run the eval on the same val set (for measuring result
+# variance). Each run gets its own CHECKPOINT_DIR (./runN) and log; after all
+# runs finish, per-round metrics and overall mean/std/var are printed.
+TOTAL_RUN="${TOTAL_RUN:-1}"
 
 case "$DATASET" in
     chembl) VAL_FILES="./data/reaction_pathway_search/validation_chembl_1000.parquet" ;;
@@ -177,7 +181,7 @@ echo "API_MODEL_NAME=$API_MODEL_NAME"
 echo "LOCAL_API_URL=$LOCAL_API_URL"
 echo "TP_SIZE=$TP_SIZE   CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not set>}"
 echo "VLLM_MAX_MODEL_LEN=$VLLM_MAX_MODEL_LEN  GPU_MEM_UTIL=$GPU_MEM_UTIL"
-echo "MAX_TURNS=$MAX_TURNS  FORCE_NOLOOP=$FORCE_NOLOOP  VAL_BATCH_SIZE=$VAL_BATCH_SIZE  VAL_RESUME=$VAL_RESUME"
+echo "MAX_TURNS=$MAX_TURNS  FORCE_NOLOOP=$FORCE_NOLOOP  VAL_BATCH_SIZE=$VAL_BATCH_SIZE  VAL_RESUME=$VAL_RESUME  TOTAL_RUN=$TOTAL_RUN"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
 echo "LF_ENV=$LF_ENV   SERVE_ENV=$SERVE_ENV   EVAL_ENV=$EVAL_ENV"
 echo "MERGE_LOG=$MERGE_LOG"
@@ -346,39 +350,151 @@ echo "API_MODEL_NAME=$API_MODEL_NAME"
 echo "API_URL=$pjlab_APImodel_url"
 echo "EVAL_MODEL_PATH=$EVAL_MODEL_PATH"
 echo "EVAL_LOG=$EVAL_LOG"
+echo "TOTAL_RUN=$TOTAL_RUN"
 echo "============"
 
-PYTHONUNBUFFERED=1 python3 -m "$MAIN_MODULE" \
-    data.val_files="$VAL_FILES" \
-    data.max_prompt_length=32768 \
-    data.max_response_length=32768 \
-    data.max_start_length=1024 \
-    data.max_tool_response_length=4096 \
-    data.val_batch_size="$VAL_BATCH_SIZE" \
-    actor_rollout_ref.model.path="$EVAL_MODEL_PATH" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
-    trainer.default_local_dir="$CHECKPOINT_DIR" \
-    trainer.val_resume="$VAL_RESUME" \
-    trainer.logger="['console']" \
-    trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
-    trainer.experiment_name="$EXPERIMENT_NAME" \
-    trainer.n_gpus_per_node="$GPUS_PER_NODE" \
-    trainer.nnodes="$NNODES" \
-    tool.debug=True \
-    tool.api_max_concurrency=128 \
-    tool.max_turns="$MAX_TURNS" \
-    tool.topk=10 \
-    tool.shuffle=False \
-    tool.maxstep=30 \
-    tool.force_noloop="$FORCE_NOLOOP" \
-    tool.use_batch_tool_calls=False \
-    tool.env="$TOOL_ENV_NAME" \
-    tool.use_api_model=True \
-    tool.api_model_name="$API_MODEL_NAME" \
-    2>&1 | tee "$EVAL_LOG"
-EVAL_RC=${PIPESTATUS[0]}
+RUN_LOGS=()
+FINAL_RC=0
+for RUN_IDX in $(seq 1 "$TOTAL_RUN"); do
+    RUN_CHECKPOINT_DIR="${CHECKPOINT_DIR}/run${RUN_IDX}"
+    if [[ "$TOTAL_RUN" == "1" ]]; then
+        RUN_EVAL_LOG="$EVAL_LOG"
+    else
+        RUN_EVAL_LOG="${EVAL_LOG%.log}_run${RUN_IDX}-of-${TOTAL_RUN}.log"
+    fi
+    RUN_LOGS+=("$RUN_EVAL_LOG")
 
-echo "[eval] finished with rc=$EVAL_RC (vLLM will be stopped by cleanup)"
-exit $EVAL_RC
+    echo ""
+    echo "=== Eval run ${RUN_IDX}/${TOTAL_RUN} ==="
+    echo "RUN_CHECKPOINT_DIR=$RUN_CHECKPOINT_DIR"
+    echo "RUN_EVAL_LOG=$RUN_EVAL_LOG"
+
+    set +e
+    PYTHONUNBUFFERED=1 python3 -m "$MAIN_MODULE" \
+        data.val_files="$VAL_FILES" \
+        data.max_prompt_length=32768 \
+        data.max_response_length=32768 \
+        data.max_start_length=1024 \
+        data.max_tool_response_length=4096 \
+        data.val_batch_size="$VAL_BATCH_SIZE" \
+        actor_rollout_ref.model.path="$EVAL_MODEL_PATH" \
+        actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
+        actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+        actor_rollout_ref.rollout.val_kwargs.n=1 \
+        trainer.default_local_dir="$RUN_CHECKPOINT_DIR" \
+        trainer.val_resume="$VAL_RESUME" \
+        trainer.logger="['console']" \
+        trainer.project_name=retro_qwen2.5-7b-instruct-1M_10_test \
+        trainer.experiment_name="$EXPERIMENT_NAME" \
+        trainer.n_gpus_per_node="$GPUS_PER_NODE" \
+        trainer.nnodes="$NNODES" \
+        tool.debug=True \
+        tool.api_max_concurrency=128 \
+        tool.max_turns="$MAX_TURNS" \
+        tool.topk=10 \
+        tool.shuffle=False \
+        tool.maxstep=30 \
+        tool.force_noloop="$FORCE_NOLOOP" \
+        tool.use_batch_tool_calls=False \
+        tool.env="$TOOL_ENV_NAME" \
+        tool.use_api_model=True \
+        tool.api_model_name="$API_MODEL_NAME" \
+        2>&1 | tee "$RUN_EVAL_LOG"
+    RUN_RC=${PIPESTATUS[0]}
+    set -e
+    echo "[eval] run ${RUN_IDX}/${TOTAL_RUN} finished with rc=$RUN_RC"
+    if [[ $RUN_RC -ne 0 ]]; then
+        FINAL_RC=$RUN_RC
+    fi
+done
+
+# --- Aggregate metrics across runs ---------------------------------------
+echo ""
+echo "=== Aggregating metrics across ${TOTAL_RUN} run(s) ==="
+PYTHONUNBUFFERED=1 python3 - "${RUN_LOGS[@]}" <<'PYAGG'
+import math, re, sys
+from pathlib import Path
+
+logs = sys.argv[1:]
+# Metric keys produced by main_agent_retro*; extend here if more are added.
+METRIC_KEYS = [
+    "val/test_score/reaction_pathway_search",
+    "val/end_score/reaction_pathway_search",
+    "val/answer_score/reaction_pathway_search",
+    "val/format_score/reaction_pathway_search",
+    "val/turns/reaction_pathway_search",
+]
+
+def parse_log(path):
+    try:
+        text = Path(path).read_text(errors="replace")
+    except FileNotFoundError:
+        return None
+    # Prefer the final "Validation metrics: {...}" pprint block for full
+    # float precision. pprint may wrap the dict across adjacent string
+    # literals, inserting `"\n "` between key and value — the regex allows
+    # whitespace/quotes on either side of the `:`. Take the highest-precision
+    # (longest) match per key to avoid the truncated `step:0 - ...` summary
+    # line that comes later in the same region.
+    tail = text[-200_000:]
+    marker = "Validation metrics"
+    idx = tail.rfind(marker)
+    if idx < 0:
+        return None
+    region = tail[idx:]
+    vals = {}
+    for key in METRIC_KEYS:
+        pat = re.escape(key) + r"['\"\s]*:[\s'\"]*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+        ms = re.findall(pat, region)
+        if not ms:
+            continue
+        # Pick the match with the most digits (highest precision).
+        best = max(ms, key=lambda s: len(s))
+        vals[key] = float(best)
+    return vals or None
+
+runs = []
+for i, log in enumerate(logs, 1):
+    r = parse_log(log)
+    runs.append(r)
+
+# Per-run table
+print()
+print("Per-run metrics:")
+header = ["run"] + [k.split("/")[-2] for k in METRIC_KEYS]
+print("  " + "  ".join(f"{h:>14s}" for h in header))
+for i, r in enumerate(runs, 1):
+    if r is None:
+        print(f"  {i:>14d}  " + "  ".join(f"{'<missing>':>14s}" for _ in METRIC_KEYS))
+        continue
+    row = [f"{i:>14d}"]
+    for k in METRIC_KEYS:
+        row.append(f"{r[k]:>14.6f}" if k in r else f"{'<n/a>':>14s}")
+    print("  " + "  ".join(row))
+
+# Aggregate stats
+valid = [r for r in runs if r is not None]
+print()
+print(f"Aggregate over {len(valid)}/{len(runs)} successful run(s):")
+if not valid:
+    print("  (no successful runs to aggregate)")
+    sys.exit(0)
+
+def stats(xs):
+    n = len(xs)
+    mean = sum(xs) / n
+    var = sum((x - mean) ** 2 for x in xs) / n  # population variance
+    return mean, math.sqrt(var), var, n
+
+for k in METRIC_KEYS:
+    xs = [r[k] for r in valid if k in r]
+    if not xs:
+        continue
+    mean, std, var, n = stats(xs)
+    short = k.split("/")[-2]
+    print(f"  {short:<14s}  mean={mean:.6f}  std={std:.6f}  var={var:.6g}  n={n}  min={min(xs):.6f}  max={max(xs):.6f}")
+PYAGG
+
+echo ""
+echo "[eval] all runs finished; final rc=$FINAL_RC (vLLM will be stopped by cleanup)"
+exit $FINAL_RC
