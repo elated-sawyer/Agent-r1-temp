@@ -46,13 +46,19 @@ case "$DATASET" in
 esac
 
 # BACKTRACK picks the main module and the tool.env value:
-#   true  -> ToolEnvRetro       (back_state tool enabled)
-#   false -> ToolEnvRetroNoBack (no back_state; force_noloop applies)
+#   true   -> ToolEnvRetro       (back_state allowed every step; prone to shallow looping)
+#   hybrid -> ToolEnvRetroHybrid (forward-only until maxstep, then a rescue back_state)
+#   false  -> ToolEnvRetroNoBack (no back_state; force_noloop applies)
 case "$BACKTRACK" in
     true|True|TRUE|1)
         MAIN_MODULE="agent_r1.src.main_agent_retro"
         TOOL_ENV_NAME="retro"
         BACK_TAG="back"
+        ;;
+    hybrid|Hybrid|HYBRID)
+        MAIN_MODULE="agent_r1.src.main_agent_retro_hybrid"
+        TOOL_ENV_NAME="retro_hybrid_V4"
+        BACK_TAG="hybrid"
         ;;
     false|False|FALSE|0)
         MAIN_MODULE="agent_r1.src.main_agent_retro_noback"
@@ -60,7 +66,7 @@ case "$BACKTRACK" in
         BACK_TAG="noback"
         ;;
     *)
-        echo "ERROR: BACKTRACK='$BACKTRACK' (expected true|false)" >&2
+        echo "ERROR: BACKTRACK='$BACKTRACK' (expected true|false|hybrid)" >&2
         exit 1
         ;;
 esac
@@ -103,7 +109,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 # export pjlab_APImodel_url="${!API_URL_VAR:-}"
 # ------------------------------------------------------------------
 export pjlab_APImodel_key="EMPTY"
-export pjlab_APImodel_url="http://100.104.48.113:20010/v1"
+export pjlab_APImodel_url="http://10.102.205.38:20010/v1"
 # ------------------------------------------------------------------
 
 echo "=== Run Config ==="

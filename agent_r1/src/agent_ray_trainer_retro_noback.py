@@ -185,7 +185,9 @@ class ValidationPipeline(object):
             api_max_concurrency=self.config.tool.get('api_max_concurrency', 32),
             debug=self.config.tool.get('debug', False),
             tool_env_mode=(
-                'back' if self.config.tool.get('env') == 'retro' else 'noback'
+                'back' if self.config.tool.get('env') == 'retro'
+                else 'hybrid' if str(self.config.tool.get('env', '')).startswith('retro_hybrid')
+                else 'noback'
             ),
         )
 

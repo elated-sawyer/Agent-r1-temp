@@ -33,6 +33,8 @@ def _default_tools(env):
         return [SingleStepRetroTool(), SelectReactionTool()]
     elif env == 'retro_noback_V4':
         return [SingleStepRetroTool(mlp_model_dump='./one_step_model/retro_star_V4.ckpt'), SelectReactionTool()]
+    elif env == 'retro_hybrid_V4':
+        return [SingleStepRetroTool(mlp_model_dump='./one_step_model/retro_star_V4.ckpt'), SelectReactionTool(), BackStateTool()]
     elif env == 'retro_noback_V2':
         return [SingleStepRetroTool(mlp_model_dump='./one_step_model/retro_star_value_ours.ckpt'), SelectReactionTool()]
     else:

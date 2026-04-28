@@ -73,11 +73,15 @@ class ToolGenerationManager:
             max_start_length=config.max_start_length,
         ))
         self._api_client = self._build_api_client() if config.use_api_model else None
-        if getattr(config, "tool_env_mode", "noback") == "back":
+        _mode = getattr(config, "tool_env_mode", "noback")
+        if _mode == "back":
             from agent_r1.tool import tool_env_retro as _env_mod
+        elif _mode == "hybrid":
+            from agent_r1.tool import tool_env_retro_hybrid as _env_mod
         else:
             from agent_r1.tool import tool_env_retro_noback as _env_mod
         self._step_fn = _env_mod.step
+        self._tool_env_mode = _mode
 
     def _build_api_client(self):
         if AsyncOpenAI is None:
@@ -525,7 +529,12 @@ class ToolGenerationManager:
                     continue
                 env = envs[ii]
 
-                if env.back_flag:
+                # In noback mode, back_flag=True is a terminal signal (there is
+                # no back_state tool, so the trajectory is dead). In back/hybrid
+                # modes, back_flag=True means "the model MUST call back_state
+                # next"; we must keep the trajectory active or the rescue path
+                # never fires.
+                if env.back_flag and self._tool_env_mode == "noback":
                     active_mask[ii] = False
 
                 for key, value in env.unsolved_dict.items():

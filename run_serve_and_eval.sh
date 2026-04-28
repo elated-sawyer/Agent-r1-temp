@@ -20,12 +20,13 @@
 #   MERGED_DIR         where to save the merged model (cached; ignored when MODEL_MODE=base)
 #   BASE_MODEL_PATH    base model (used directly when MODEL_MODE=base; merge source when sft)
 #   DATASET            chembl | retro            (default: retro)
-#   BACKTRACK          true | false              (default: false)
-#                      true  -> main_agent_retro  + tool.env=retro        (back_state allowed)
-#                      false -> main_agent_retro_noback + tool.env=retro_noback_V4
+#   BACKTRACK          true | hybrid | false     (default: false)
+#                      true   -> main_agent_retro  + tool.env=retro        (back_state every step)
+#                      hybrid -> main_agent_retro_hybrid + tool.env=retro_hybrid_V4 (back_state only after maxstep)
+#                      false  -> main_agent_retro_noback + tool.env=retro_noback_V4
 #   MAX_TURNS          tool-use turns per traj   (default: 100)
 #   FORCE_NOLOOP       True | False              (default: True)
-#                      only used when BACKTRACK=false
+#                      used when BACKTRACK=false or BACKTRACK=hybrid
 #   VAL_BATCH_SIZE                                (default: 128)
 #   VAL_RESUME         True | False              (default: True)
 #   TP_SIZE            tensor-parallel size      (default: from CUDA_VISIBLE_DEVICES, fallback 4)
@@ -69,13 +70,19 @@ case "$DATASET" in
 esac
 
 # BACKTRACK picks the main module and the tool.env value:
-#   true  -> ToolEnvRetro       (back_state tool enabled)
-#   false -> ToolEnvRetroNoBack (no back_state; force_noloop applies)
+#   true   -> ToolEnvRetro       (back_state allowed every step; prone to shallow looping)
+#   hybrid -> ToolEnvRetroHybrid (forward-only until maxstep, then a rescue back_state)
+#   false  -> ToolEnvRetroNoBack (no back_state; force_noloop applies)
 case "$BACKTRACK" in
     true|True|TRUE|1)
         MAIN_MODULE="agent_r1.src.main_agent_retro"
         TOOL_ENV_NAME="retro"
         BACK_TAG="back"
+        ;;
+    hybrid|Hybrid|HYBRID)
+        MAIN_MODULE="agent_r1.src.main_agent_retro_hybrid"
+        TOOL_ENV_NAME="retro_hybrid_V4"
+        BACK_TAG="hybrid"
         ;;
     false|False|FALSE|0)
         MAIN_MODULE="agent_r1.src.main_agent_retro_noback"
@@ -83,7 +90,7 @@ case "$BACKTRACK" in
         BACK_TAG="noback"
         ;;
     *)
-        echo "ERROR: BACKTRACK='$BACKTRACK' (expected true|false)" >&2
+        echo "ERROR: BACKTRACK='$BACKTRACK' (expected true|false|hybrid)" >&2
         exit 1
         ;;
 esac
